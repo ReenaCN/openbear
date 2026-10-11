@@ -5687,6 +5687,10 @@ async def test_agent_wait_plan_notification_wakes_immediately_and_requeues_if_un
         "runRootTurnUuid": root_turn_uuid,
     })
     assert queued is not None and second_queued is not None
+    # Dense streaming must not hide the authoritative Plan or either notification.
+    for index in range(75):
+        await web_env.server.agent_dao.append_event(task_uuid, "model_stream_progress",
+            detail={"textChars": index + 1})
     web_env.server._web_controller_notifications[row["conversation_uuid"]] = [queued, second_queued]
     web_env.server._web_task_notification_pending[row["conversation_uuid"]] = [queued, second_queued]
 
@@ -5712,7 +5716,14 @@ async def test_agent_wait_plan_notification_wakes_immediately_and_requeues_if_un
     assert len(payload["notifications"]) == 2
     assert all(item["kind"] == "plan-approval-required" for item in payload["notifications"])
     assert len(payload["agents"]) == 2
-    plan_runtime = payload["agents"][0]["planRuntime"]
+    observed = payload["agents"][0]
+    # Hidden model telemetry does not consume the controller's page budget.
+    assert observed["eventPage"]["hasMore"] is False
+    assert any(event["kind"] == "plan_submitted" for event in observed["recentEvents"])
+    assert observed["deliveryEvidence"]["known"] is True
+    assert observed["deliveryEvidence"]["changedSinceReview"] is None
+    assert observed["hasMeaningfulProgress"] == observed["hasActivity"]
+    plan_runtime = observed["planRuntime"]
     assert plan_runtime["pendingPlanVersion"] == 1
     assert plan_runtime["plan"]["objective"] == "Wake AgentWait immediately"
     assert plan_runtime["steps"][0]["criteria"][0]["id"] == "c1"
@@ -5890,6 +5901,11 @@ async def test_agent_wait_event_only_wakes_when_last_sibling_terminal_notificati
             run_root_turn_uuid=root_turn_uuid,
         ))
 
+    for task_uuid in task_uuids:
+        for index in range(75):
+            await web_env.server.agent_dao.append_event(task_uuid, "model_stream_progress",
+                detail={"textChars": index + 1})
+
     live = web_env.server._live_for(row)
     renderer = _WebStreamRenderer(live)
     await live.publish({"type": "accepted", "turnUuid": root_turn_uuid})
@@ -5950,6 +5966,10 @@ async def test_agent_wait_event_only_wakes_when_last_sibling_terminal_notificati
     payload = json.loads(str(wait_result["content"]))
     assert payload["wakeReason"] == "task_notification"
     assert payload["summary"] == {"running": 0, "waitingControl": 0, "terminal": 2, "total": 2}
+    assert not payload["reviewPending"]
+    assert all(not item["eventPage"]["hasMore"] for item in payload["agents"])
+    assert all(item["currentExecution"]["phase"] == "completed" for item in payload["agents"])
+    assert all(item["deliveryEvidence"]["known"] is False for item in payload["agents"])
     assert {item["taskUuid"] for item in payload["notifications"]} == set(task_uuids)
     assert web_env.server._web_task_notification_pending.get(conversation_uuid) in (None, [])
 
@@ -6439,7 +6459,21 @@ async def test_assistant_events_use_source_native_operation_specs_without_hidden
     assert ops["assistant:turn-native-assistant:0"]["status"] == "completed"
     assert ops["assistant:turn-native-assistant:0"]["payload"]["text"] == "最终"
     assert ops["reasoning:turn-native-assistant:0"]["lifecycle"] == "terminal"
-    assert ops["reasoning:turn-native-assistant:0"]["payload"]["text"] == "想完"
+    # Finished reasoning is collapsed by default: /state carries no text, only
+    # a detail marker; the full text is served by the detail endpoint.
+    assert "text" not in ops["reasoning:turn-native-assistant:0"]["payload"]
+    assert ops["reasoning:turn-native-assistant:0"]["payload"]["textChars"] == 2
+    assert ops["reasoning:turn-native-assistant:0"]["detailAvailable"] is True
+    assert ops["reasoning:turn-native-assistant:0"]["detailLoaded"] is False
+    full = {op["opId"]: op for op in await web_env.server._web_operations(conv_uuid)}
+    assert full["reasoning:turn-native-assistant:0"]["payload"]["text"] == "想完"
+    cookie = await _login_cookie(web_env)
+    detail_response = await web_env.client.get(
+        f"/api/conversations/{conv_uuid}/operations/reasoning%3Aturn-native-assistant%3A0/detail",
+        cookies={"openbear_web_session": cookie},
+    )
+    assert detail_response.status == 200
+    assert (await detail_response.json())["operation"]["payload"]["text"] == "想完"
     frames = await web_env.server._web_frames(conv_uuid)
     assistant_frames = [frame for frame in frames if frame["opId"] == "assistant:turn-native-assistant:0"]
     reasoning_frames = [frame for frame in frames if frame["opId"] == "reasoning:turn-native-assistant:0"]

@@ -551,6 +551,10 @@ def format_user_interaction_result_line(tool_name: str, arguments: str, result: 
             if sensitive:
                 return "✍️ 用户已输入文本（已隐藏）。"
             return f"✍️ 用户输入：{_short_text(value)}" if value else "✍️ 用户已输入文本。"
+        if data.get("decision") == "confirm_with_changes":
+            return "✅ 用户已授权按补充内容修订后执行。"
+        if data.get("decision") == "reject":
+            return "🚫 用户已拒绝执行。"
         if data.get("decision") == "feedback" or str(data.get("text") or "").strip():
             return "✍️ 用户已提交意见，未确认执行原操作。"
         label = _short_text(str(data.get("label") or data.get("choice") or ""), 60)
@@ -563,6 +567,8 @@ def format_user_interaction_result_line(tool_name: str, arguments: str, result: 
         status = str(data.get("status") or "")
         if status == "scheduled":
             return f"✅ 控制动作已安排：{action}"
+        if status == "amendments_required":
+            return f"✅ 用户已授权；需先落实补充内容：{action}"
         if status == "cancelled":
             confirmation = data.get("confirmation") or {}
             if isinstance(confirmation, dict) and str(confirmation.get("text") or "").strip():

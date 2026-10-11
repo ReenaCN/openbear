@@ -1,6 +1,7 @@
 # ruff: noqa: F401,F403,F405
 from __future__ import annotations
 
+from app.agent.progress_watch import ProgressWatch
 from app.agents.agent_prompt import render_agent_base_system_prompt
 from app.agents.plan import PlanError
 from app.tools.allowlist import agent_delegation_catalog, agent_delegation_names, preserve_tool_allowlist
@@ -483,6 +484,10 @@ class WebAdminAgentsMixin:
                         "status": str(detail.get("status") or "ok"),
                         "usage": usage,
                         "totalTimeMs": int(detail.get("durationMs") or 0),
+                        "connectMs": int(detail.get("connectMs") or 0),
+                        "firstTokenMs": int(detail.get("firstTokenMs") or 0),
+                        "attemptId": str(detail.get("attemptId") or ""),
+                        "usageReported": detail.get("usageReported"),
                         "outputTokens": usage.output_tokens,
                         "errorType": str(detail.get("errorType") or ""),
                     },
@@ -528,6 +533,7 @@ class WebAdminAgentsMixin:
                 retry_jitter_ratio=self.config.agent.retry_jitter_ratio,
                 retry_cancel_check=lambda: self.agents.consume_retry_cancel(task_uuid),
                 retry_control_check=lambda wait_id: self.agents.consume_retry_action(task_uuid, wait_id),
+                progress_watch=ProgressWatch.from_config(self.config.agent, agent=True),
                 model_call_limit=int(getattr(self.config.agents, "agent_model_call_limit", 20) or 0),
                 tool_call_limit=int(getattr(self.config.agents, "agent_tool_call_limit", 40) or 0),
                 plan_control_call_limit=int(getattr(self.config.agents, "plan_control_call_limit", 200) or 200),

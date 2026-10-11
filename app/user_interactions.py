@@ -17,6 +17,7 @@ from typing import Any
 from app.db.engine import DB
 from app.interaction_data import canonical_answer, empty_result, normalize_definition, redact_result
 from app.logging import get_logger
+from app.tools.confirmation import constraints_within
 
 log = get_logger("user_interactions")
 Listener = Callable[[str, dict[str, Any]], Awaitable[None]]
@@ -40,6 +41,9 @@ class InteractionService:
         # No network or notification callback is awaited under this lock.
         self._lock = asyncio.Lock()
         self._closed = False
+        # Raw conditional answers remain process-local (including sensitive text).
+        # They cannot survive a restart or authorize another conversation/turn.
+        self._amended_approvals: dict[str, dict[str, Any]] = {}
 
     def add_listener(self, listener: Listener) -> None:
         if listener not in self._listeners:
@@ -47,7 +51,9 @@ class InteractionService:
 
     @staticmethod
     def _public(item: dict[str, Any], *, redact: bool = False) -> dict[str, Any]:
-        out = copy.deepcopy({key: value for key, value in item.items() if key not in {"future", "expiresAtMono"}})
+        out = copy.deepcopy({key: value for key, value in item.items() if key not in {
+            "future", "expiresAtMono", "approvalScope", "approvalConstraints", "approvalPolicy",
+        }})
         if redact and out.get("sensitive"):
             out.update(title="敏感交互", body="", conversationTitle="", options=[], questions=[], defaultValue="", defaultValues=[], defaultIndexes=[])
             if "result" in out:
@@ -86,9 +92,16 @@ class InteractionService:
             await self._emit("resolved", item)
 
     async def stop(self) -> None:
-        self._closed = True
-        for interaction_id in list(self.pending):
-            await self.terminate(interaction_id, "interrupted")
+        events = []
+        async with self._lock:
+            self._closed = True
+            self._amended_approvals.clear()
+            for interaction_id in list(self.pending):
+                item = await self._terminate_locked(interaction_id, "interrupted")
+                if item is not None:
+                    events.append(item)
+        for item in events:
+            await self._emit("resolved", item)
 
     def pending_for(self, conversation_uuid: str) -> list[dict[str, Any]]:
         now = _now_ms()
@@ -140,6 +153,8 @@ class InteractionService:
             return {"status": "error", "error": "invalid_questionnaire" if payload.get("action") == "questionnaire" else "invalid_interaction", "details": errors}
         if not conversation_uuid or not owner_chat_id:
             return {"status": "error", "error": "missing_interaction_owner", "confirmed": False}
+        if payload.get("_approvalId") is not None:
+            return await self._resume_approval(payload, item, owner_chat_id, conversation_uuid, turn_uuid)
         cid = secrets.token_urlsafe(12).replace("-", "_")
         created = _now_ms()
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
@@ -150,14 +165,21 @@ class InteractionService:
             expiresAtMs=created + max(1, int(item["timeoutSeconds"] * 1000)),
             expiresAtMono=time.monotonic() + item["timeoutSeconds"], future=future,
         )
-        async with self.db.write_transaction(label="interaction_create") as conn:
-            await conn.execute(
-                "INSERT INTO user_interactions(interaction_id,owner_chat_id,conversation_uuid,turn_uuid,tool_call_id,payload_json,status,revision,expires_at_ms,created_at_ms) VALUES(?,?,?,?,?,?,'pending',1,?,?)",
-                (cid, int(owner_chat_id), conversation_uuid, turn_uuid, tool_call_id,
-                 _json(self._public(item, redact=True)), item["expiresAtMs"], created),
-            )
-        self.pending[cid] = item
-        self.by_conversation.setdefault(conversation_uuid, set()).add(cid)
+        if item.get("requiresAuthorization") and payload.get("_approvalScope"):
+            item["approvalScope"] = copy.deepcopy(payload["_approvalScope"])
+            item["approvalConstraints"] = copy.deepcopy(payload.get("_approvalConstraints", {}))
+            item["approvalPolicy"] = payload.get("_approvalPolicy", "native_scope")
+        async with self._lock:
+            if self._closed:
+                return {"status": "error", "error": "interaction_service_stopped", "confirmed": False}
+            async with self.db.write_transaction(label="interaction_create") as conn:
+                await conn.execute(
+                    "INSERT INTO user_interactions(interaction_id,owner_chat_id,conversation_uuid,turn_uuid,tool_call_id,payload_json,status,revision,expires_at_ms,created_at_ms) VALUES(?,?,?,?,?,?,'pending',1,?,?)",
+                    (cid, int(owner_chat_id), conversation_uuid, turn_uuid, tool_call_id,
+                     _json(self._public(item, redact=True)), item["expiresAtMs"], created),
+                )
+            self.pending[cid] = item
+            self.by_conversation.setdefault(conversation_uuid, set()).add(cid)
         try:
             await self._emit("created", item)
             remaining = max(0, item["expiresAtMono"] - time.monotonic())
@@ -174,6 +196,44 @@ class InteractionService:
             # Covers cancellation of event publication or unexpected waiter errors.
             if cid in self.pending:
                 await asyncio.shield(self.terminate(cid, "interrupted"))
+
+    async def _resume_approval(self, payload, item, owner, conversation, turn):
+        """Consume a trusted user receipt, never a model-supplied boolean."""
+        cid = payload.get("_approvalId")
+        if not isinstance(cid, str):
+            return {"status": "error", "confirmed": False, "error": "invalid_amended_approval"}
+        async with self._lock:
+            self._prune_approvals()
+            receipt = self._amended_approvals.get(cid)
+            if (self._closed or not receipt or not item.get("requiresAuthorization") or not turn
+                    or receipt["ownerChatId"] != owner or receipt["conversationUuid"] != conversation
+                    or receipt["turnUuid"] != turn or receipt["sourceTool"] != item["sourceTool"]
+                    or receipt["action"] != item["action"]):
+                return {"status": "error", "confirmed": False, "error": "amended_approval_invalid_or_out_of_scope"}
+            if (receipt["approvalScope"] != payload.get("_approvalScope")
+                    or not constraints_within(receipt["approvalConstraints"], payload.get("_approvalConstraints", {}))):
+                exact = receipt["approvalPolicy"] == "exact_arguments"
+                return {"status": "error", "confirmed": False,
+                        "error": "amended_approval_arguments_changed" if exact else "amended_approval_invalid_or_out_of_scope",
+                        "message": ("通用 MCP 回执仅限原业务参数。保留全部附言，用修订参数不带 _openbearApprovalId 重新调用工具取得确认；不得为复用回执恢复冲突旧参数。"
+                                    if exact else "修订请求超出此回执可验证的范围。保留全部附言，不要恢复冲突旧方案；需明确确认新的范围。")}
+            self._amended_approvals.pop(cid)
+            # Old text is retained in the original answer; the caller has now
+            # explicitly resubmitted after applying it. Do not carry permanent
+            # trust choices from an amended MCP request into this one-use grant.
+            result = copy.deepcopy(receipt["result"])
+            result.update(confirmed=True, decision="confirm", choice="confirm", text="",
+                          requiresAmendment=False, authorizationResumed=True,
+                          appliedConditions=result["text"])
+            result.pop("instruction", None)
+            if item["sourceTool"] == "MCP":
+                result.update(selectedValues=["once"], selectedIndexes=[0], selectedLabels=["仅本次允许"])
+            return result
+
+    def _prune_approvals(self):
+        now = _now_ms()
+        self._amended_approvals = {cid: receipt for cid, receipt in self._amended_approvals.items()
+                                  if receipt["approvalExpiresAtMs"] > now}
 
     @staticmethod
     def _digest(result: dict[str, Any]) -> str:
@@ -234,6 +294,15 @@ class InteractionService:
                 )
                 if cur.rowcount != 1:
                     return {"ok": False, "statusCode": 409, "error": "confirmation_already_resolved"}
+            if (result.get("decision") == "confirm_with_changes" and result.get("authorizationGranted")
+                    and item.get("requiresAuthorization") and item.get("approvalScope") and item.get("turnUuid")):
+                self._prune_approvals()
+                receipt = self._public(item)
+                receipt.update(approvalScope=copy.deepcopy(item["approvalScope"]),
+                               approvalConstraints=copy.deepcopy(item["approvalConstraints"]),
+                               approvalPolicy=item["approvalPolicy"],
+                               result=copy.deepcopy(result), approvalExpiresAtMs=_now_ms() + 3_600_000)
+                self._amended_approvals[interaction_id] = receipt
             event_item = self._complete_local(item, result)
         if event_item is not None:
             await self._emit("resolved", event_item)
@@ -242,26 +311,41 @@ class InteractionService:
     async def terminate(self, interaction_id: str, status: str = "cancelled") -> None:
         if status not in {"cancelled", "timeout", "interrupted"}:
             raise ValueError("invalid interaction terminal status")
-        event_item = None
         async with self._lock:
-            item = self.pending.get(interaction_id)
-            if item is None:
-                return
-            result = empty_result(item, status)
-            async with self.db.write_transaction(label="interaction_terminate") as conn:
-                cur = await conn.execute(
-                    "UPDATE user_interactions SET status=?,revision=revision+1,result_json=?,resolved_at_ms=? WHERE interaction_id=? AND status='pending'",
-                    (status, _json(redact_result(result) if item.get("sensitive") else result), _now_ms(), interaction_id),
-                )
-                if cur.rowcount != 1:
-                    return
-            event_item = self._complete_local(item, result)
+            event_item = await self._terminate_locked(interaction_id, status)
         if event_item is not None:
             await self._emit("resolved", event_item)
 
+    async def _terminate_locked(self, interaction_id: str, status: str):
+        """Caller owns _lock. Notification callbacks must run after releasing it."""
+        item = self.pending.get(interaction_id)
+        if item is None:
+            return None
+        result = empty_result(item, status)
+        async with self.db.write_transaction(label="interaction_terminate") as conn:
+            cur = await conn.execute(
+                "UPDATE user_interactions SET status=?,revision=revision+1,result_json=?,resolved_at_ms=? WHERE interaction_id=? AND status='pending'",
+                (status, _json(redact_result(result) if item.get("sensitive") else result), _now_ms(), interaction_id),
+            )
+            if cur.rowcount != 1:
+                return None
+        return self._complete_local(item, result)
+
     async def cancel_conversation(self, conversation_uuid: str, *, status: str = "cancelled") -> None:
-        for cid in list(self.by_conversation.get(conversation_uuid, ())):
-            await self.terminate(cid, status)
+        if status not in {"cancelled", "timeout", "interrupted"}:
+            raise ValueError("invalid interaction terminal status")
+        events = []
+        async with self._lock:
+            # Linearize revocation with submit/consume, including a submit that
+            # held the lock while waiting for its DB transaction to finish.
+            self._amended_approvals = {cid: receipt for cid, receipt in self._amended_approvals.items()
+                                      if receipt["conversationUuid"] != conversation_uuid}
+            for cid in list(self.by_conversation.get(conversation_uuid, ())):
+                item = await self._terminate_locked(cid, status)
+                if item is not None:
+                    events.append(item)
+        for item in events:
+            await self._emit("resolved", item)
 
     async def prune(self, *, before_ms: int | None = None) -> int:
         before = before_ms if before_ms is not None else _now_ms() - 30 * 86_400_000

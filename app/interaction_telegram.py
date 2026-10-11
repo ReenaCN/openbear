@@ -635,8 +635,8 @@ class InteractionTelegram:
                 lines.append(f"问卷：共 {len(questions)} 题；逐题保存，最后统一提交。")
             else:
                 lines.extend(["", "可直接回复本消息填写文字；点击最终提交后才会结束交互。"])
-                if bool(item.get("requiresAuthorization")):
-                    lines.append("⚠️ 这是授权型选择：有文字时只提交意见，不执行原操作。")
+                if action == "confirm" or bool(item.get("requiresAuthorization")):
+                    lines.append("可按补充内容确认执行，也可仅提交意见；附言授权仅限本次操作。")
         return "\n".join(lines)
 
     def _root_keyboard(
@@ -672,7 +672,11 @@ class InteractionTelegram:
                 has_text = bool(str(draft.get("text_value") or "").strip())
                 authorization_feedback = bool(item.get("requiresAuthorization")) and has_text
                 confirm_feedback = action == "confirm" and has_text
-                submit_text = "提交意见（不执行原操作）" if authorization_feedback or confirm_feedback else "✅ 最终提交"
+                submit_text = "仅提交意见，暂不执行" if authorization_feedback or confirm_feedback else "✅ 最终提交"
+                if action == "confirm" and draft.get("confirm_decision") == "reject":
+                    submit_text = "拒绝并提交说明（不执行）" if has_text else "确认拒绝"
+                elif (confirm_feedback or (authorization_feedback and draft.get("selected_values"))):
+                    rows.append([InlineKeyboardButton(text="按补充内容确认执行", callback_data=self._callback(token, "approve_changes"))])
                 rows.append([InlineKeyboardButton(text=submit_text, callback_data=self._callback(token, "submit"))])
             rows.append([InlineKeyboardButton(text="放弃回答", callback_data=self._callback(token, "cancel"))])
         web_button = self._web_button(item)
@@ -1205,8 +1209,8 @@ class InteractionTelegram:
                 await self._queue_refresh(draft)
                 await self._safe_callback_answer(query, "草稿已清除")
                 return
-            if command == "submit":
-                payload, error = self._simple_payload(item, draft)
+            if command in {"submit", "approve_changes"}:
+                payload, error = self._simple_payload(item, draft, approve_changes=command == "approve_changes")
                 if error:
                     await self._safe_callback_answer(query, error, alert=True)
                     return
@@ -1335,11 +1339,13 @@ class InteractionTelegram:
             })
         return {"revision": int(item.get("revision") or 1), "answers": answers}
 
-    def _simple_payload(self, item: dict[str, Any], draft: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    def _simple_payload(self, item: dict[str, Any], draft: dict[str, Any], *, approve_changes: bool = False) -> tuple[dict[str, Any], str]:
         action = str(item.get("action") or "").lower()
         revision = int(item.get("revision") or 1)
         text_value = str(draft.get("text_value") or "")
         has_text = bool(text_value.strip())
+        if approve_changes and (not has_text or (action != "confirm" and not (action == "select" and item.get("requiresAuthorization")))):
+            return {}, "请填写补充内容后再确认执行"
         if action == "prompt":
             if not has_text:
                 return {}, "请先回复提示消息填写内容"
@@ -1347,24 +1353,27 @@ class InteractionTelegram:
         if action == "select":
             selected_values = list(draft.get("selected_values") or [])
             selected_indexes = [int(value) for value in (draft.get("selected_indexes") or [])]
-            if not selected_values and not has_text:
-                return {}, "请至少选择一项或填写自己的答案"
+            if not selected_values and (not has_text or approve_changes):
+                return {}, "请至少选择一项或仅提交意见"
             return {
                 "revision": revision,
                 "selectedValues": selected_values,
                 "selectedIndexes": selected_indexes,
                 "text": text_value,
+                **({"decision": "confirm_with_changes"} if approve_changes else {}),
             }, ""
         if action == "confirm":
             selected = str(draft.get("confirm_decision") or "")
             if not selected and not has_text:
                 return {}, "请选择确认/拒绝，或填写自己的意见"
-            decision = "feedback" if has_text else selected
+            if approve_changes and selected == "reject":
+                return {}, "当前选择为拒绝，请先更改选择"
+            decision = "confirm_with_changes" if approve_changes else "reject" if selected == "reject" else "feedback" if has_text else selected
             payload: dict[str, Any] = {
                 "revision": revision,
                 "decision": decision,
                 "text": text_value,
-                "confirmed": bool(decision == "confirm" and not has_text),
+                "confirmed": decision in {"confirm", "confirm_with_changes"},
             }
             # selectedDecision is optional in the canonical protocol. Sending an
             # explicit null for a text-only opinion is invalid; omit it so the

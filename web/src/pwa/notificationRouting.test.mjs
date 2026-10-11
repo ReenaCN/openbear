@@ -105,6 +105,37 @@ for (const initial of ['/settings?section=system-settings&setting=web.taskNotifi
   });
 }
 
+for (const reuse of [false, true]) {
+  test(`recommendation push preserves its destination through worker click and App route, reuse=${reuse}`, async () => {
+    const destination = '/recommendations';
+    const {win, messages} = browser('/chat?id=existing');
+    const routes = [];
+    const stop = installPushNavigation(win, async url => {routes.push(url); win.location = new URL(url, origin);});
+    let handled, focuses = 0;
+    const client = {url: win.location.href, async focus() {focuses++;}, postMessage(data) {handled = messages.get('message')({data});}};
+    const w = worker(reuse ? client : null);
+    await w.event('push', {data: {json: () => ({kind: 'recommendation', path: destination, body: '推荐已更新'})}});
+    assert.equal(w.notices[0].options.data.url, destination);
+    await w.event('notificationclick', {notification: {close() {}, data: w.notices[0].options.data}});
+    if (reuse) {
+      await handled;
+      assert.deepEqual(routes, [destination]); assert.equal(focuses, 1);
+      assert.deepEqual(w.opened, []);
+    } else {
+      assert.deepEqual(w.opened, [origin + destination]);
+      assert.deepEqual(routes, []);
+    }
+    const app = parse(readFileSync(new URL('../App.vue', import.meta.url), 'utf8')).descriptor.scriptSetup.content;
+    const ast = parseJs(app, {sourceType: 'module'});
+    const route = ast.program.body.find(n => n.type === 'FunctionDeclaration' && n.id.name === 'routeForCurrentState');
+    const paths = ast.program.body.find(n => n.type === 'VariableDeclaration' && n.declarations.some(d => d.id.name === 'pageToPath'));
+    const context = vm.createContext({URLSearchParams, window: win, active: Vue.ref('recommendations')});
+    vm.runInContext(app.slice(paths.start, paths.end) + '\n' + app.slice(route.start, route.end), context);
+    assert.equal(vm.runInContext('routeForCurrentState()', context), destination);
+    stop();
+  });
+}
+
 test('cancelled SPA navigation does not reveal notification settings or replace the page', async () => {
   const {win, messages} = browser('/cron');
   let navigated = false;
@@ -117,7 +148,7 @@ test('cancelled SPA navigation does not reveal notification settings or replace 
 });
 
 test('invalid notification URL falls back safely and login windows are not reused', async () => {
-  for (const url of ['http://[', 'https://evil.test/chat', '/api/auth/session']) {
+  for (const url of ['http://[', 'https://evil.test/chat', '/api/auth/session', 'https://evil.test/recommendations', 'https://user:pass@bear.test/recommendations', '/recommendations/', '/recommendations-extra', '/api/recommendations/cards', '/%72ecommendations']) {
     const client = {url: origin + '/login', postMessage() {assert.fail('must not navigate login SPA');}};
     const w = worker(client);
     await w.event('notificationclick', {notification: {close() {}, data: {url}}});

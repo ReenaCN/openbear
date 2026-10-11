@@ -31,7 +31,7 @@ htmlcov/
 workspace/
 .release-runs/
 .release-environment.json
-/evals/agent_delegation/reports/
+/evals/
 .serena/
 .cloakbrowser/
 .DS_Store
@@ -39,6 +39,7 @@ workspace/
 # ─── Web 前端构建产物 ────────────────────────────────────────
 web/node_modules/
 web/dist/
+/web/.dist-before-*/
 web/data/
 web/logs/
 

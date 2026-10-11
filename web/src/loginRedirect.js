@@ -4,7 +4,7 @@ export function notificationTarget(value, origin) {
   if (typeof value !== "string" || !value || /[\\\u0000-\u0020\u007f]/.test(value)) return "";
   try {
     const url = new URL(value, origin);
-    if (url.origin !== origin || url.username || url.password || !["/chat", "/settings"].includes(url.pathname)) return "";
+    if (url.origin !== origin || url.username || url.password || !["/chat", "/settings", "/recommendations"].includes(url.pathname)) return "";
     return url.pathname + url.search;
   } catch { return ""; }
 }

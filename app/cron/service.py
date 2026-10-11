@@ -11,6 +11,7 @@ from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from app.tools.confirmation import argument_digest, constraints_within
 from app.cron.contracts import CronError, JobConfig, Schedule, timestamp
 from app.cron.schedule import next_state, preview_details
 from app.cron.holidays import MissingCalendar
@@ -259,14 +260,27 @@ class CronService:
         self.wake.set()
         return result
 
-    async def delete_impact(self, owner, job_id, request):
+    async def _delete_constraints(self, conn, job_id):
+        runs = await many(conn, "SELECT run_id FROM cron_runs WHERE job_id=? AND status IN ('starting','running')", (job_id,))
+        return {'sets': {'activeRuns': [row['run_id'] for row in runs]}}
+
+    async def delete_impact(self, owner, job_id, request, *, tool_approval=False):
         async with self.db.write_transaction(label='cron-delete-preview') as conn:
             row = await self.row(conn, owner, job_id); self.check_revision(row, request)
             counts = await one(conn, "SELECT COUNT(*) total,COUNT(CASE WHEN status IN ('starting','running') THEN 1 END) active FROM cron_runs WHERE job_id=?", (job_id,))
             token = secrets.token_urlsafe(32)
             self.confirmations = {k: v for k, v in self.confirmations.items() if v['expiry'] > self.clock()}
-            self.confirmations[digest(token)] = dict(owner=owner, job=job_id, revision=row['revision'], expiry=self.clock()+300000)
-            return {'impact': {'activeRuns': counts['active'], 'retainedRuns': counts['total']}, 'confirmationToken': token}
+            grant = dict(owner=owner, job=job_id, revision=row['revision'], expiry=self.clock()+300000)
+            result = {'impact': {'activeRuns': counts['active'], 'retainedRuns': counts['total']}, 'confirmationToken': token}
+            if tool_approval:
+                # Identity/revision are exact; existing active runs may finish.
+                # Run IDs, not counts, prevent a replacement run reusing a grant.
+                grant['approvalConstraints'] = await self._delete_constraints(conn, job_id)
+                result.update(approvalScope={'contract': 'cron-delete-v1', 'jobId': job_id, 'revision': row['revision'],
+                    'parameters': argument_digest({k: v for k, v in request.items() if k not in ('requestId', 'expectedRevision')})},
+                    approvalConstraints=grant['approvalConstraints'])
+            self.confirmations[digest(token)] = grant
+            return result
 
     async def tool_delete_result(self, owner, job_id, request):
         # A replay is identified by the original tool intent, not a fresh grant.
@@ -285,6 +299,9 @@ class CronService:
             if not grant or grant['owner'] != owner or grant['job'] != job_id or grant['expiry'] <= self.clock():
                 raise CronError('confirmation_required', status=403)
             if grant['revision'] != row['revision']: raise CronError('confirmation_stale', status=409)
+            if ('approvalConstraints' in grant and not constraints_within(
+                    grant['approvalConstraints'], await self._delete_constraints(conn, job_id))):
+                raise CronError('confirmation_stale', status=409)
             await conn.execute("UPDATE cron_jobs SET enabled=0,next_run_at_ms=NULL,schedule_state='deleted',deleted_at_ms=?,updated_at_ms=?,revision=revision+1 WHERE job_id=?", (self.clock(), self.clock(), job_id))
             result = {'job': await self.public(conn, await self.row(conn, owner, job_id, deleted=True))}
             await self.record(conn, owner, intent, fp, result)

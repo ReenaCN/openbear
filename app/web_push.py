@@ -101,7 +101,8 @@ class BrowserPush:
 
     @staticmethod
     def payload(kind: str, conversation: str, key: str, *, task_title: str = "", elapsed_seconds: int | None = None) -> dict:
-        labels = {"completed": "任务已完成", "failed": "任务执行失败", "interrupted": "任务已中断", "interaction": "有一项操作需要你确认", "test": "本设备的通知测试"}
+        labels = {"completed": "任务已完成", "failed": "任务执行失败", "interrupted": "任务已中断", "interaction": "有一项操作需要你确认", "test": "本设备的通知测试",
+                  "recommendation": "推荐已更新"}
         title = " ".join(str(task_title or "").split())
         if len(title) > 80:
             title = title[:79] + "…"
@@ -115,7 +116,8 @@ class BrowserPush:
             detail += " · 耗时 " + duration
         body = f"{title}\n{detail}" if title else detail
         return {"title": "OpenBear", "body": body, "conversationUuid": conversation,
-                "tag": "openbear:" + key, "kind": kind, "createdAt": int(time.time())}
+                "tag": "openbear:" + key, "kind": kind, "createdAt": int(time.time()),
+                **({"path": "/recommendations"} if kind == "recommendation" else {})}
 
     async def enqueue(self, owner: int, conversation: str, key: str, kind: str, *, conn=None,
                       task_title: str = "", elapsed_seconds: int | None = None):

@@ -299,6 +299,6 @@ class WebhookService:
         from app.webhooks.controls import control
         return await control(self,owner,eid,request,action=action)
 
-    async def prepare(self,owner,eid,action,request):
+    async def prepare(self,owner,eid,action,request,*,tool_approval=False):
         from app.webhooks.controls import prepare
-        return await prepare(self,owner,eid,action,request)
+        return await prepare(self,owner,eid,action,request,tool_approval=tool_approval)

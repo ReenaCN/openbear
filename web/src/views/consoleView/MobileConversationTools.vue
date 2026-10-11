@@ -3,10 +3,12 @@ import {nextTick, onBeforeUnmount, onMounted, ref, watch} from "vue";
 import {ChatLineRound, CollectionTag, DataAnalysis, EditPen, Hide, Lock, Money, MoreFilled, Search, Timer, Unlock} from "@element-plus/icons-vue";
 import {useMessageVisibility} from './messageVisibility.js';
 const visibility = useMessageVisibility();
-import {cachePct, fmtTokens, shortText} from "./display.js";
+import {cachePct, conversationPathText, fmtTokens, shortText} from "./display.js";
 
 const props = defineProps({
 	conversationUuid: {type: String, default: ""},
+	conversationPath: {type: String, default: ""},
+	running: {type: Boolean, default: false},
 	hiddenCount: {type: Number, default: 0},
 	turns: {type: Array, default: () => []},
 	activeTurnIndex: {type: Number, default: 0},
@@ -49,6 +51,10 @@ function turnLabel(turn, index) { return shortText(visibility.userContent(turn),
 		<button type="button" class="mobile-more-button" aria-label="更多会话操作" aria-haspopup="dialog" :aria-expanded="menuOpen" @click="menuOpen = !menuOpen"><MoreFilled/></button>
 		<el-drawer v-model="menuOpen" direction="btt" size="auto" title="会话工具" class="mobile-conversation-menu mobile-viewport-sheet" append-to-body>
 			<div class="mobile-sheet-grip" aria-hidden="true"></div>
+			<section class="mobile-conversation-location" aria-label="会话信息">
+				<div class="mobile-location-caption"><span>所在目录</span><span v-if="props.running" class="mobile-location-running">运行中</span></div>
+				<p>{{ conversationPathText(props.conversationPath) }}</p>
+			</section>
 			<section class="mobile-conversation-summary" aria-label="会话统计">
 				<div class="mobile-summary-caption">会话统计<span class="mobile-summary-total">{{ fmtTokens((props.tokenParts.input || 0) + (props.tokenParts.output || 0)) }} <small>Tokens</small></span></div>
 				<dl class="mobile-summary-metrics">
@@ -87,6 +93,10 @@ function turnLabel(turn, index) { return shortText(visibility.userContent(turn),
 .mobile-conversation-tools { display: flex; flex: 0 0 auto; }
 .mobile-more-button { display: grid; place-items: center; width: 44px; height: 44px; padding: 0; appearance: none; border: 0; border-radius: 10px; background: transparent; color: var(--ob-chat-subtle); cursor: pointer; }
 .mobile-more-button svg { width: 19px; height: 19px; }
+.mobile-conversation-location { margin: 2px 3px 12px; padding: 0 10px; }
+.mobile-location-caption { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--ob-chat-muted); font-size: 11px; line-height: 20px; }
+.mobile-location-running { flex: none; color: var(--ob-success); }
+.mobile-conversation-location p { margin: 4px 0 0; color: var(--ob-chat-text); font-size: 12px; line-height: 18px; white-space: normal; overflow-wrap: anywhere; }
 .mobile-conversation-summary { margin: 2px 3px 10px; padding: 13px; border: 1px solid var(--ob-chat-line); border-radius: 12px; background: var(--ob-chat-bg); }
 .mobile-summary-caption { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: var(--ob-chat-muted); font-size: 11px; font-weight: 400; line-height: 20px; }
 .mobile-summary-total { color: var(--ob-chat-text); font-size: 17px; font-weight: 500; font-variant-numeric: tabular-nums; }

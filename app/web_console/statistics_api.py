@@ -346,13 +346,13 @@ def read_statistics(
               SUM(COALESCE(cache_write_tokens,0)) AS cache_write_tokens,
               SUM(COALESCE(cost_usd,0)) AS cost_usd,
               SUM(COALESCE(connect_ms,0)) AS connect_ms,
-              SUM(COALESCE(first_token_ms,0)) AS first_token_ms,
+              SUM(CASE WHEN model_call_count=1 AND first_token_ms>0 THEN first_token_ms ELSE 0 END) AS first_token_ms,
               SUM(COALESCE(total_time_ms,0)) AS total_time_ms,
-              SUM(CASE WHEN first_token_ms>0 THEN COALESCE(NULLIF(model_ok_count,0),COALESCE(NULLIF(model_call_count,0),1)) ELSE 0 END) AS first_samples,
-              SUM(CASE WHEN connect_ms>0 AND first_token_ms>0 AND total_time_ms>0 THEN connect_ms ELSE 0 END) AS timed_connect_ms,
-              SUM(CASE WHEN connect_ms>0 AND first_token_ms>0 AND total_time_ms>0 THEN first_token_ms ELSE 0 END) AS timed_first_token_ms,
-              SUM(CASE WHEN connect_ms>0 AND first_token_ms>0 AND total_time_ms>0 THEN total_time_ms ELSE 0 END) AS timed_total_time_ms,
-              SUM(CASE WHEN connect_ms>0 AND first_token_ms>0 AND total_time_ms>0 THEN COALESCE(NULLIF(model_ok_count,0),COALESCE(NULLIF(model_call_count,0),1)) ELSE 0 END) AS timing_samples
+              SUM(CASE WHEN model_call_count=1 AND first_token_ms>0 THEN 1 ELSE 0 END) AS first_samples,
+              SUM(CASE WHEN model_call_count=1 AND connect_ms>0 AND first_token_ms>0 AND total_time_ms>0 THEN connect_ms ELSE 0 END) AS timed_connect_ms,
+              SUM(CASE WHEN model_call_count=1 AND connect_ms>0 AND first_token_ms>0 AND total_time_ms>0 THEN first_token_ms ELSE 0 END) AS timed_first_token_ms,
+              SUM(CASE WHEN model_call_count=1 AND connect_ms>0 AND first_token_ms>0 AND total_time_ms>0 THEN total_time_ms ELSE 0 END) AS timed_total_time_ms,
+              SUM(CASE WHEN model_call_count=1 AND connect_ms>0 AND first_token_ms>0 AND total_time_ms>0 THEN 1 ELSE 0 END) AS timing_samples
             FROM model_calls
             WHERE chat_id IN ({chat_marks}) AND created_at>=? AND created_at<?
             GROUP BY day, hour_ts, model, source, status, error_type, latency_bucket

@@ -20,13 +20,26 @@ const walk=nodes=>(nodes||[]).flatMap(n=>[n,...walk(Array.isArray(n.children)?n.
 const nodes=file=>walk(baseParse(descriptors[file].template.content).children);
 const hasClass=(n,name)=>n.props?.some(p=>p.name==='class'&&p.value?.content.split(/\s+/).includes(name));
 
-test('phone header shows compact path/title/navigation/More without cumulative metrics or model controls',()=>{
+test('phone header reserves its identity width for the title with no path or properties menu',()=>{
   const app='../../App.vue',header='ConsoleHeader.vue';
   assert.equal(css(app,'.app-shell.is-console .mobile-app-bar').display,'none');
   assert.equal(css(app,'.app-shell.is-console .app-main')['padding-top'],'0');
   assert.equal(css(app,'.mobile-app-bar').display,'flex','other app views retain navigation');
   assert.equal(css(header,'.console-header').height,'calc(60px + env(safe-area-inset-top, 0px))');
-  assert.equal(css(header,'.header-subtitle').display,'block');
+  for(const width of [320,360,390,430,760]){
+    const env={...phone,width};
+    assert.equal(css(header,'.header-title-stack',env).position,'relative');
+    assert.equal(css(header,'.header-title-stack',env)['padding-right'],'12px','reserve the same tiny status space while idle and running');
+    assert.equal(css(header,'.header-subtitle',env).display,'none');
+    assert.equal(css(header,'.header-title-row',env).flex,'1');
+    assert.equal(css(header,'.header-title-row',env).overflow,'hidden');
+    assert.equal(css(header,'.header-properties-dropdown',env).display,'none');
+  }
+  for(const selector of ['.header-title-stack','.header-title-row','.header-properties-dropdown']){
+    assert.equal(css(header,selector,desktop).display,undefined);
+    assert.equal(css(header,selector,{...desktop,width:761}).display,undefined);
+  }
+  assert.equal(css(header,'.header-subtitle',desktop)['max-width'],undefined);
   assert.equal(css(header,'.header-title')['font-size'],'13px');
   assert.equal(css(header,'.header-metrics').display,'none');
   assert.equal(css(header,'.header-mobile-actions').display,'flex');
@@ -196,24 +209,24 @@ test('message hover timestamps keep desktop hover and compact-window behavior',(
 // Exercise the production formatters without importing the unrelated .vue icons in display.js.
 const displaySource=fs.readFileSync(new URL('./display.js',import.meta.url),'utf8');
 const formatterContext=vm.createContext({});
-for(const name of ['trimCompactNumber','fmtTokens','cachePct','tokenLine']){
+for(const name of ['trimCompactNumber','fmtTokens','cachePct','tokenLine','conversationPathText']){
   const source=displaySource.match(new RegExp(`(?:export )?function ${name}\\([^]*?^}`, 'm'))?.[0];
   assert.ok(source,`production formatter ${name}`);
   vm.runInContext(source.replace(/^export /,''),formatterContext);
 }
-const {fmtTokens,cachePct,tokenLine}=vm.runInContext('({fmtTokens,cachePct,tokenLine})',formatterContext);
+const {fmtTokens,cachePct,tokenLine,conversationPathText}=vm.runInContext('({fmtTokens,cachePct,tokenLine,conversationPathText})',formatterContext);
 
 function mobileRuntime(){
   const calls=[],mounted=[],unmounted=[],watchers=[];
-  const props={conversationUuid:'A',turns:[{id:'1',user:{content:'first'}},{id:'2',user:{content:'second'}}],activeTurnIndex:1,autoScrollLocked:true,tokenParts:{input:1250000,output:8300,cache:1000000},durationText:'12m 34s',costText:'$3.4567'};
+  const props={conversationUuid:'A',conversationPath:'工程 / OpenBear',running:false,turns:[{id:'1',user:{content:'first'}},{id:'2',user:{content:'second'}}],activeTurnIndex:1,autoScrollLocked:true,tokenParts:{input:1250000,output:8300,cache:1000000},durationText:'12m 34s',costText:'$3.4567'};
   const media={matches:true,addEventListener(){},removeEventListener(){}};
-  const context=vm.createContext({ref,nextTick,fmtTokens,cachePct,useMessageVisibility:()=>({userContent:turn=>turn?.user?.content||''}),defineProps:()=>props,defineEmits:()=>((...args)=>calls.push(args)),onMounted:fn=>mounted.push(fn),onBeforeUnmount:fn=>unmounted.push(fn),watch:(getter,fn)=>watchers.push(fn),window:{matchMedia:()=>media},shortText:(s,max)=>s.slice(0,max)});
+  const context=vm.createContext({ref,nextTick,fmtTokens,cachePct,conversationPathText,useMessageVisibility:()=>({userContent:turn=>turn?.user?.content||''}),defineProps:()=>props,defineEmits:()=>((...args)=>calls.push(args)),onMounted:fn=>mounted.push(fn),onBeforeUnmount:fn=>unmounted.push(fn),watch:(getter,fn)=>watchers.push(fn),window:{matchMedia:()=>media},shortText:(s,max)=>s.slice(0,max)});
   vm.runInContext(descriptors['MobileConversationTools.vue'].scriptSetup.content.replace(/^import .*;\n/gm,''),context);
   mounted.forEach(fn=>fn());
   return{context,props,media,calls,watchers,unmounted};
 }
 async function renderTools(runtime){
-  const bindings=vm.runInContext('({props,fmtTokens,cachePct,phone:phone.value,menuOpen:menuOpen.value,navigationOpen:navigationOpen.value,navigationList:null,chooseAction,openNavigation,chooseTurn,revealCurrentTurn,turnLabel,emit})',runtime.context);
+  const bindings=vm.runInContext('({props,fmtTokens,cachePct,conversationPathText,phone:phone.value,menuOpen:menuOpen.value,navigationOpen:navigationOpen.value,navigationList:null,chooseAction,openNavigation,chooseTurn,revealCurrentTurn,turnLabel,emit})',runtime.context);
   const slots=[],compiled=compile(descriptors['MobileConversationTools.vue'].template.content);let tree;
   const app=createSSRApp({render(){tree=compiled.call(this,bindings,[]);return tree;}});
   app.component('ElPopover',{inheritAttrs:false,props:['visible'],render(){const children=[...(this.$slots.reference?.()||[]),...(this.visible?(this.$slots.default?.()||[]):[])];slots.push(...children);return children;}});
@@ -227,13 +240,15 @@ test('mobile summary uses the same desktop total parts and formatters, with no n
   const binding=(node,name)=>node.props.find(p=>p.name==='bind'&&p.arg?.content===name)?.exp?.content;
   assert.equal(binding(header,'tokens-text'),'totalTokensDisplay');
   assert.equal(binding(tools,'token-parts'),'totalTokenParts');
+  assert.equal(binding(tools,'conversation-path'),'props.conversationPath');
+  assert.equal(binding(tools,'running'),'running');
   assert.equal(binding(header,'tokens-detail'),'totalTokensDetail');
   assert.equal(binding(header,'cache-percent-text'),'cachePct(totalTokenParts.cache, totalTokenParts.input)');
   assert.equal(cachePct(30,135),'22.2%','cache is read hits / full prompt, not output or cache writes');
   assert.equal(cachePct(0,0),'—');
   assert.equal(cachePct(0,100),'0.0%');
   assert.match(sources['ConsoleView.vue'],/const totalTokens = computed\(\(\) => totalTokenParts.value.input \+ totalTokenParts.value.output\)/);
-  assert.match(descriptors['MobileConversationTools.vue'].scriptSetup.content,/import \{cachePct, fmtTokens, shortText\} from "\.\/display.js"/);
+  assert.match(descriptors['MobileConversationTools.vue'].scriptSetup.content,/import \{cachePct, conversationPathText, fmtTokens, shortText\} from "\.\/display.js"/);
   assert.equal(binding(header,'duration-ms'),'totalDurationMs');
   assert.equal(binding(tools,'duration-text'),'totalDurationDisplay');
   assert.equal(binding(composer,'tokens-text'),'totalTokensDisplay');
@@ -265,6 +280,25 @@ test('More shows read-only live totals on demand and retains every action',async
   assert.doesNotMatch(view.html,/1.25M|12m 34s/);assert.deepEqual(r.calls,[]);
 });
 
+test('full conversation path and running text stay available in More without taking header width',async()=>{
+  const r=mobileRuntime();
+  assert.doesNotMatch((await renderTools(r)).html,/所在目录|工程/);
+  vm.runInContext('menuOpen.value=true',r.context);
+  let view=await renderTools(r);
+  assert.match(view.html,/所在目录/);assert.match(view.html,/\/工程\/OpenBear/);
+  assert.doesNotMatch(view.html,/mobile-location-running/);
+  Object.assign(r.props,{conversationPath:'项目 / 很长的目录名称 / 移动后的位置',running:true});
+  view=await renderTools(r);
+  assert.match(view.html,/\/项目\/很长的目录名称\/移动后的位置/);
+  assert.match(view.html,/mobile-location-running[^>]*>运行中/);
+  assert.doesNotMatch(view.html,/\/工程\/OpenBear/);
+  r.props.conversationPath='';
+  assert.match((await renderTools(r)).html,/<p>—<\/p>/);
+  assert.equal(css('MobileConversationTools.vue','.mobile-conversation-location p')['overflow-wrap'],'anywhere');
+  assert.equal(css('ConsoleHeader.vue','.header-title-stack',desktop)['padding-right'],undefined);
+  assert.deepEqual(r.calls,[]);
+});
+
 test('screenshot-sized token totals use three full-width rows, keeping cache count and percentage together',async()=>{
   const r=mobileRuntime();vm.runInContext('menuOpen.value=true',r.context);
   const cases=[
@@ -293,7 +327,7 @@ test('screenshot-sized token totals use three full-width rows, keeping cache cou
   assert.deepEqual(r.calls,[]);
 });
 
-test('running indicator is a mobile-only green dot plus text tag, and is absent when idle',async()=>{
+test('running indicator is a mobile-only out-of-flow dot that never shrinks the title',async()=>{
   const compiled=compile(descriptors['ConsoleHeader.vue'].template.content);
   for(const running of [true,false]){
     const props={title:'测试会话',running,status:'就绪',runStartedAt:0,tokensText:'10',durationText:'1s',costText:'$0.0010'};
@@ -301,16 +335,17 @@ test('running indicator is a mobile-only green dot plus text tag, and is absent 
     for(const name of ['BearLogo','DataAnalysis','Money','Stopwatch','Timer'])app.component(name,{render:()=>h('svg')});
     app.directive('elapsed',{getSSRProps:()=>({})});
     await renderToString(app);
-    const tag=walk([tree]).find(n=>n.type==='span'&&n.props?.class==='header-mobile-running');
+    const stack=walk([tree]).find(n=>n.type==='div'&&n.props?.class?.includes('header-title-stack'));
+    const tag=walk([stack]).find(n=>n.type==='span'&&n.props?.class==='header-mobile-running');
     assert.equal(Boolean(tag),running);
     if(tag){assert.equal(tag.props.role,'status');assert.equal(tag.props['aria-label'],'运行中');
       assert.equal(tag.children[0].type,'i');assert.equal(tag.children[0].props['aria-hidden'],'true');
-      assert.equal(tag.children[1].children,'运行中');}
+      assert.equal(tag.props.title,'运行中');assert.equal(tag.children.length,1);}
   }
   for(const width of [320,390,760]){
     const env={...phone,width},tag=css('ConsoleHeader.vue','.header-mobile-running',env);
-    assert.equal(tag.display,'inline-flex');assert.equal(tag['white-space'],'nowrap');assert.equal(tag.flex,'none');
-    assert.equal(tag.color,'var(--ob-success)');assert.equal(tag.height,'22px');
+    assert.equal(tag.display,'inline-flex');assert.equal(tag.position,'absolute');assert.equal(tag.right,'0');
+    assert.equal(tag.color,'var(--ob-success)');assert.equal(tag.height,'6px');assert.equal(tag.width,'6px');
   }
   assert.equal(css('ConsoleHeader.vue','.header-mobile-running',desktop).display,'none');
   assert.equal(css('ConsoleHeader.vue','.header-mobile-running i')['background'],'currentColor');

@@ -75,6 +75,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_turn
   ON messages(chat_id, turn_uuid, id);
 CREATE INDEX IF NOT EXISTS idx_messages_chat_root_turn
   ON messages(chat_id, run_root_turn_uuid, id);
+CREATE INDEX IF NOT EXISTS idx_messages_agent_wait_review
+  ON messages(chat_id, conversation_uuid, run_root_turn_uuid, id)
+  WHERE role='tool' AND name='AgentWait' AND task_uuid='';
 -- Statistics reads only external user turns and must be able to stop at the
 -- selected time range instead of walking a conversation's complete history.
 CREATE INDEX IF NOT EXISTS idx_messages_user_chat_time
@@ -1143,6 +1146,13 @@ CREATE INDEX IF NOT EXISTS idx_rath_task_events_task_seq
   ON rath_task_events(task_uuid, seq);
 CREATE INDEX IF NOT EXISTS idx_rath_task_events_kind_time
   ON rath_task_events(kind, ts DESC, id DESC);
+-- Applied to existing databases by DB.connect's idempotent schema script too.
+CREATE INDEX IF NOT EXISTS idx_rath_task_events_task_kind_seq
+  ON rath_task_events(task_uuid, kind, seq);
+CREATE INDEX IF NOT EXISTS idx_rath_task_events_controller_review
+  ON rath_task_events(task_uuid, seq)
+  WHERE kind NOT GLOB 'model_*'
+    AND kind NOT IN ('tool_call_started', 'tool_call_finished');
 
 CREATE TABLE IF NOT EXISTS rath_task_artifacts (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,

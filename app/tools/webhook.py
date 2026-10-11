@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from app.tools.base import current_tool_context
 from app.runtime.tool_result import ToolOutcome
@@ -12,6 +13,7 @@ from app.webhooks import queries, receipts, waits
 ACTIONS=('describe','list','get','create','update','delete','set_enabled','pause','resume','stop','events','retry','wait','report','telemetry')
 READONLY={'describe','events','get','report'}
 AUTOMATIC={'describe','get','events','wait','report','telemetry'}
+GUIDANCE=(Path(__file__).resolve().parents[2]/'prompts'/'guides'/'webhook.md').read_text(encoding='utf-8')
 
 
 async def dispatch(service,action,params,ctx):
@@ -26,7 +28,7 @@ async def dispatch(service,action,params,ctx):
     a=await one(service.db.conn,'SELECT * FROM webhook_assignments WHERE conversation_uuid=? AND root_turn_uuid=?',(ctx.conversation_uuid,ctx.run_root_turn_uuid))
     if a: ctx.webhook_assignment_id=a['assignment_id']
     if action=='describe':
-        return {'actions':list(ACTIONS),'requested':params.get('action'),'protocol':{
+        return {'actions':list(ACTIONS),'requested':params.get('action'),'guidance':GUIDANCE,'protocol':{
             'wait':{'op':'register | await | cancel','register':{'requestId':'stable ID','endpointId':'owned endpoint','match':{'all':[{'path':'body.orderId','op':'eq','value':'123'}]},'afterSeq':'optional task-start cursor override','timeoutSeconds':'positive seconds or null','collection':'optional batching settings'},'await':{'waitId':'registered ID'}},
             'report':{'receiptId':'stable ID','results':[{'eventId':'owned and delivered event','outcome':'completed | skipped | failed | unknown','summary':'supported claim','evidenceRefs':['tool-action:existing-action-id'],'result':'optional structured result'}]},
             'management':'get before update; expectedRevision/expectedControlRevision + stable requestId; sensitive operations invoke the real user confirmation gate; keys never returned to model',
@@ -72,8 +74,12 @@ async def dispatch(service,action,params,ctx):
         sensitive='rotate_key' if action=='update' else action
         if ctx.web_confirm is None: raise WebhookError('user_confirmation_unavailable',status=403)
         body.pop('operation',None)
-        prepared=await service.prepare(owner,eid,sensitive,body)
-        answer=await ctx.web_confirm({'_sourceTool':'Webhook','_requiresAuthorization':True,'title':'确认Webhook '+sensitive,'body':dumps(prepared['impact']),
+        prepared=await service.prepare(owner,eid,sensitive,body,tool_approval=True)
+        effects = ({'stopRunning': body.get('stopRunning', False), 'scope': body.get('scope', 'all')}
+                   if sensitive == 'delete' else {'graceSeconds': body.get('graceSeconds', 0)})
+        answer=await ctx.web_confirm({'_sourceTool':'Webhook','_requiresAuthorization':True,
+                                      '_approvalScope':prepared['approvalScope'],'_approvalConstraints':prepared['approvalConstraints'],
+                                      'title':'确认Webhook '+sensitive,'body':dumps({'impact':prepared['impact'], **effects}),
                                       'type':'warning','default':False,'confirmText':'执行明确操作','cancelText':'取消','timeoutSeconds':300})
         if not answer.get('confirmed') or answer.get('text') or answer.get('feedback'): return {'cancelled':True,'userFeedback':answer}
         result=await service.control(owner,eid,{'confirmationToken':prepared['confirmationToken'],'requestId':body.get('requestId')},action=sensitive)
@@ -95,5 +101,5 @@ def register_webhook_tool(registry,service):
     async def handler(args):
         try: return dumps(await dispatch(service,args.get('action'),args.get('params',{}),current_tool_context()))
         except WebhookError as exc: return ToolOutcome(dumps(exc.payload),'failed','not_started')
-    registry.add('Webhook','Manage authorized external triggers; register/await external events, report owned outcomes, query observations. Use describe for action contracts. Identity is supplied by runtime; keys never enter model context.',
+    registry.add('Webhook','Manage authorized external triggers; register/await external events, report owned outcomes, query observations. Call describe before create/update; it returns the action contracts and design guidance. Identity is supplied by runtime; keys never enter model context. Amended receipts keep endpoint/config/control versions fixed; deletion may reduce stopRunning or stop scope and affected resources may finish, never expand. Rotation parameters stay exact.',
                       {'type':'object','properties':{'action':{'type':'string','enum':list(ACTIONS)},'params':{'type':'object'}},'required':['action'],'additionalProperties':False},handler,visibility={'main','agent'},effect_scope='external_event')

@@ -13,6 +13,7 @@ const TOOL_LABELS = {
 	mcp__parrot__web_search: '搜索', mcp__parrot__web_fetch: '阅读网页',
 	mcp__parrot__image_generate: '生成图片', mcp__parrot__image_edit: '编辑图片',
 	mcp__parrot__video_generate: '生成视频', mcp__parrot__video_status: '视频进度',
+	Recommendation: '推荐',
 };
 export function toolDisplayLabel(name, fallback = '') {
 	return TOOL_LABELS[name] || fallback || name || '工具';
@@ -155,6 +156,29 @@ function agentSummary(name, data) {
 	return '';
 }
 
+const REC_KINDS = {interest: '关注点', ongoing: '进行中的事', preference: '偏好', background: '背景', habit: '工作习惯'};
+const REC_STATUS = {active: '进行中', paused: '搁置', done: '已完成', dropped: '放弃', unknown: '不清楚'};
+const REC_LANES = {external: '外部发现', openbear: 'OpenBear 建议'};
+function recommendationSummary(data) {
+	const p = object(data.params);
+	switch (data.action) {
+		case 'status': return '查看本轮范围、预算与当前画像';
+		case 'source.next': return '读取下一批对话材料';
+		case 'source.commit': return '确认这批材料已分析';
+		case 'source.read': return '读取某个会话的完整原文';
+		case 'profile.list': return join('查看画像', REC_KINDS[p.kind] || '');
+		case 'profile.upsert': return join(`${p.id ? '更新' : '记录'}画像：${REC_KINDS[p.kind] || '条目'}`, quoted(p.topic), REC_STATUS[p.status] || '');
+		case 'profile.remove': return '移除一条画像';
+		case 'card.save': return join(`保存推荐卡片（${REC_LANES[p.lane] || '外部发现'}）`, quoted(p.title));
+		case 'card.list': return '查看近期卡片';
+		case 'follow.list': return '查看持续关注';
+		case 'follow.resolve': return '处理一条关注变化';
+		case 'insights.get': return '查看 OpenBear 运行统计';
+		case 'internal.search': return join('查找自己的会话和记忆', quoted(p.query));
+		default: return text(data.action);
+	}
+}
+
 // Returns an empty string when a tool has no parameter-aware translator yet.
 export function toolActionSummary(name, value) {
 	const data = object(value);
@@ -175,6 +199,7 @@ export function toolActionSummary(name, value) {
 	else if (name === 'WebSearch' || name === 'mcp__parrot__web_search') summary = join(quoted(data.query), data.freshness ? ({day:'一天内',week:'一周内',month:'一月内',year:'一年内'})[data.freshness] || '' : '');
 	else if (name === 'WebExtract' || name === 'mcp__parrot__web_fetch') summary = pageAddress(data.url);
 	else if (['mcp__parrot__image_generate','mcp__parrot__image_edit','mcp__parrot__video_generate'].includes(name)) summary = text(data.prompt);
+	else if (name === 'Recommendation') summary = recommendationSummary(data);
 	else if (name === 'mcp__parrot__video_status') summary = join('查询视频生成进度', text(data.request_id, 36));
 	return text(summary, 160);
 }

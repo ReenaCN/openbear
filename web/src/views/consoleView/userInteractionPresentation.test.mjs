@@ -21,6 +21,24 @@ function view(action, status = "answered", extraArgs = {}, extraResult = {}) {
 	});
 }
 
+test("amended approval shows authorization and exact conditions, not feedback or completed execution", () => {
+	const model = view("confirm", "answered", {}, {
+		decision: "confirm_with_changes", confirmed: true, authorizationGranted: true,
+		text: " 不建立软链接，其余照做\n不需要再次确权 ", source: "web",
+	});
+	assert.equal(model.statusKey, "confirmed_with_changes");
+	assert.equal(model.confirmed, true);
+	assert.equal(model.statusLabel, "已授权 · 按补充内容执行");
+	assert.equal(model.confirmText, " 不建立软链接，其余照做\n不需要再次确权 ");
+	assert.equal(model.intro, "用户已授权按补充内容修订后执行");
+	const summary = buildUserInteractionView({interaction: {
+		action: "confirm", interactionStatus: "answered", decision: "confirm_with_changes", confirmed: true,
+	}});
+	assert.equal(summary.statusKey, "confirmed_with_changes", "collapsed history survives reload");
+	assert.equal(view("confirm", "answered", {}, {decision: "reject", text: "先不做"}).statusKey, "rejected");
+	assert.equal(view("select", "answered", {}, {decision: "confirm_with_changes", text: "按附言"}).statusKey, "confirmed_with_changes");
+});
+
 test("typed and exact legacy UserInteraction are recognized without misclassifying ordinary tools", () => {
 	assert.equal(isUserInteractionOperation({opType: "user_interaction", payload: {}}), true);
 	assert.equal(isUserInteractionOperation({opType: "tool", payload: {name: "UserInteraction"}}), true);

@@ -21,6 +21,7 @@ from app.agent.native_continuation import (
     native_items_for_tool_calls,
     serialize_messages,
 )
+from app.agent.progress_watch import ProgressWatch
 from app.agent.transcript_repair import repair_role_alternation
 from app.context.configuration import conversation_strategy
 from app.context.prompts import effective_context_prompt
@@ -322,6 +323,7 @@ class AgentExecutor(AgentTaskContext):
         retry_jitter_ratio: float = 0.0,
         retry_cancel_check=None,
         retry_control_check=None,
+        progress_watch: ProgressWatch | None = None,
         model_call_limit: int = 40,
         tool_call_limit: int = 80,
         plan_control_call_limit: int = 200,
@@ -373,6 +375,8 @@ class AgentExecutor(AgentTaskContext):
         )
         self.retry_cancel_check = retry_cancel_check
         self.retry_control_check = retry_control_check
+        # 无推进提醒：只在下一次模型请求前追加提醒，不打断、不改档位。
+        self.progress_watch = progress_watch
         self.model_call_limit = max(0, int(model_call_limit or 0))
         self.tool_call_limit = max(0, int(tool_call_limit or 0))
         self.plan_control_call_limit = max(1, int(plan_control_call_limit or 200))
@@ -969,6 +973,10 @@ class AgentExecutor(AgentTaskContext):
         })
         mark_source(messages[-1], kind="control", task_uuid=self.task_uuid,
                     turn_uuid=self.turn_uuid, run_root_turn_uuid=self.run_root_turn_uuid)
+        # Controls can be consumed after tools, during window preparation or at
+        # completion as well as before_model. Reset only when actually appended.
+        if self.progress_watch is not None:
+            self.progress_watch.on_user_input()
         return True
 
     async def _queue_steer(self, control: Any, stage: str, *, agent_key: str = "", paused: bool = False) -> None:
@@ -1041,10 +1049,25 @@ class AgentExecutor(AgentTaskContext):
         if not pending_tools:
             append_guidance()
 
+        watch = self.progress_watch
+        if watch is not None:
+            watch.reset()
+
         class AgentHost:
             async def before_model(host_self):
                 nonlocal tools
                 await self._checkpoint_and_append_steers("before_model", messages)
+                if watch is not None and round_no > 0:
+                    notice = watch.take_notice()
+                    if notice:
+                        messages.append(mark_source({"role": "user", "content": notice},
+                            kind="control", task_uuid=self.task_uuid, control="progress_reminder",
+                            turn_uuid=self.turn_uuid, run_root_turn_uuid=self.run_root_turn_uuid))
+                        await self.emit("progress_reminder", agent_key=self.agent.agent_key,
+                            summary=f"已 {int(watch.threshold_s // 60)} 分钟以上没有推进，已提醒 Agent 重新审视状态（第 {watch.count} 次）",
+                            detail={"count": watch.count, "round": round_no})
+                if watch is not None:
+                    watch.on_model_step()
                 if self._budget_exhausted("model"):
                     await self._raise_budget_control("model", messages=messages, round_no=round_no, last_text=last_text)
                 tools = await self._allowed_tool_schemas()
@@ -1092,8 +1115,12 @@ class AgentExecutor(AgentTaskContext):
                     stage="before_tool_call", last_text=last_text,
                     extra_state={**batch_checkpoint(inflight=call.id),
                                  "inflightTool": {"id": call.id, "name": call.name}})
+                if watch is not None:
+                    watch.on_tool(call.name, call.arguments)
                 tool_result = await self._dispatch_tool(call.name, call.arguments,
                     round_no=round_no, tool_call_id=call.id)
+                if watch is not None:
+                    watch.on_tool_finished(call.name, call.arguments)
                 messages.append({"role": "tool", "tool_call_id": call.id,
                                  "name": call.name, "content": tool_result})
                 await self._checkpoint_model_context(messages, round_no=round_no,
@@ -2051,6 +2078,7 @@ class AgentExecutor(AgentTaskContext):
             detail = {
                 **_usage_detail(usage, cost), "model": self.model, "modelLabel": self.model_label,
                 "thinkLevel": self.think_level, "durationMs": outcome.total_time_ms,
+                "connectMs": outcome.connect_ms, "firstTokenMs": outcome.first_token_ms,
                 "tps": usage.output_tokens * 1000 / outcome.total_time_ms if outcome.total_time_ms > 0 else 0.0,
                 "status": outcome.status, "errorType": outcome.error.reason if outcome.error else "",
                 "taskUuid": self.task_uuid, "serviceTier": outcome.response.service_tier,
@@ -2078,6 +2106,7 @@ class AgentExecutor(AgentTaskContext):
                         "round": round_no, "attempt": max(0, attempt_no - 1),
                         "attemptId": outcome.attempt_id, "status": outcome.status,
                         "reason": detail["errorType"], "durationMs": outcome.total_time_ms,
+                        "connectMs": outcome.connect_ms, "firstTokenMs": outcome.first_token_ms,
                         "textChars": len(partial.text), "toolCallCount": len(outcome.response.tool_calls),
                     })
             else:
@@ -2116,6 +2145,8 @@ class AgentExecutor(AgentTaskContext):
             raise AgentNeedsControl(self._context_overflow_control_payload(error, attempts=overflow_attempt))
 
         async def retry_state(payload):
+            if self.progress_watch is not None:
+                self.progress_watch.on_retry_wait(bool(payload.get("active")))
             session = current_session()
             if session:
                 await session.phase("retry_wait" if payload.get("active") else "model", waiting=bool(payload.get("active")))

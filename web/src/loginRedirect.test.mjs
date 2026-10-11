@@ -9,7 +9,7 @@ import {createLoginFlow} from './views/loginFlow.js';
 
 const origin = 'https://bear.test';
 const location = path => new URL(path, origin);
-const targets = ['/chat?id=a%26b%2F%E4%BC%9A%E8%AF%9D', '/settings?section=system-settings&domain=notifications'];
+const targets = ['/chat?id=a%26b%2F%E4%BC%9A%E8%AF%9D', '/settings?section=system-settings&domain=notifications', '/recommendations', '/recommendations?source=push'];
 
 for (const target of targets) {
   test(`notification destination survives the real API 401 and LoginView success chain: ${target}`, async () => {
@@ -60,6 +60,9 @@ for (const target of targets) {
 
 test('login targets reject external, ambiguous and non-whitelisted destinations', () => {
   for (const value of ['https://evil.test/chat', '//evil.test/chat', '/\\evil.test/chat', 'javascript:alert(1)', '/api/auth/session', '/login?next=/chat', '/memory', '/%2f%2fevil.test/chat', '%2Fchat', '/chat\n?x=1', '/chat\t', 'https://bear.test/chat', 'chat?id=x']) {
+    assert.equal(loginSuccessTarget(location(`/login?next=${encodeURIComponent(value)}`)), '/', value);
+  }
+  for (const value of ['https://evil.test/recommendations', '//evil.test/recommendations', '/recommendations/', '/recommendations-extra', '/api/recommendations/cards', '/%72ecommendations']) {
     assert.equal(loginSuccessTarget(location(`/login?next=${encodeURIComponent(value)}`)), '/', value);
   }
   assert.equal(loginSuccessTarget(location('/login')), '/');

@@ -175,7 +175,7 @@ test('reference shelf anchors outside the whole launcher, retaining desktop hove
 });
 
 function runtime(){
-  const nav=vm.runInNewContext(app.slice(app.indexOf('const nav = ['),app.indexOf('const pageToPath =')).replace('const nav =','result ='),{MemoryView:null,SecretsView:null,DocsView:null,CronView:null,SkillsView:null,McpView:null,SettingsHubView:null,StatisticsView:null,WebhooksView:null});
+  const nav=vm.runInNewContext(app.slice(app.indexOf('const nav = ['),app.indexOf('const pageToPath =')).replace('const nav =','result ='),{MemoryView:null,SecretsView:null,DocsView:null,CronView:null,SkillsView:null,McpView:null,SettingsHubView:null,StatisticsView:null,WebhooksView:null,RecommendationsView:null});
   const props={items:nav.filter(item=>!item.headerOnly),active:'docs',sidebarOpen:true},calls=[],mount=[],unmount=[],watchers=[];
   const media={matches:true,addEventListener(){},removeEventListener(){}};
   const context=vm.createContext({defineProps:()=>props,defineEmits:()=>((...args)=>calls.push(args)),ref,onMounted:fn=>mount.push(fn),onBeforeUnmount:fn=>unmount.push(fn),watch:(getter,fn)=>watchers.push(fn),window:{matchMedia:()=>media}});

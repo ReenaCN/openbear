@@ -3,6 +3,7 @@ import {computed, markRaw, nextTick, onBeforeUnmount, onMounted, provide, ref, s
 import {ElMessage, ElMessageBox} from "element-plus";
 import {
 	ChatLineRound,
+	ArrowDown,
 	Hide,
 	Loading,
 	Search,
@@ -75,7 +76,7 @@ import {
 	mergeStatsContextUsage,
 	resolveContextUsage,
 } from "./contextUsage.js";
-import {reconcileAgentTaskUsage} from "./turnStats.js";
+import {combineTimingStats, reconcileAgentTaskUsage, timingStatsFromRows} from "./turnStats.js";
 import {
 	applyOperationFrame,
 	convergeStoppedAcknowledgement,
@@ -123,6 +124,7 @@ import {
 	runConfigForDisplay,
 } from "./runConfigState.js";
 import {createAttachmentDraftStorage, planAttachmentDraftRecord} from "./attachmentDraftStorage.js";
+import {createAttachmentDropHandlers} from "./attachmentDrop.js";
 import {captureTranscriptContentAnchor, transcriptContentAnchorDelta} from "./transcriptContentAnchor.js";
 import {createTimelineReuse} from "./timelineReuse.js";
 
@@ -143,8 +145,10 @@ const props = defineProps({
 	// an explicit reassignment confirmation; persisted conversations use it as the
 	// target for cross-family "new conversation" creation.
 	folderId: {type: String, default: ""},
+	// A recommendation card's "continue" request: fill the composer only.
+	recommendationDraft: {type: Object, default: null},
 });
-const emit = defineEmits(["conversation-created", "conversations-refresh", "properties"]);
+const emit = defineEmits(["conversation-created", "conversations-refresh", "properties", "recommendation-draft-applied"]);
 
 const loading = ref(false);
 // A replacement state request must finish an outstanding entry scroll instead
@@ -185,6 +189,15 @@ const runConfigOverride = ref(null);
 const scroller = ref(null);
 const autoScrollLocked = ref(true);
 const scrollerOverflow = ref(false);
+const scrollerAwayFromBottom = ref(false);
+const timelineContent = ref(null);
+watch(timelineContent, (el, _, onCleanup) => {
+	updateScrollerOverflow();
+	if (!el || typeof ResizeObserver === 'undefined') return;
+	const observer = new ResizeObserver(updateScrollerOverflow);
+	observer.observe(el);
+	onCleanup(() => observer.disconnect());
+}, {flush: 'post'});
 const activeTurnIndex = ref(0);
 const taskMemoryDrawer = ref(null);
 const contextEditor = ref(null);
@@ -398,7 +411,7 @@ const messageVisibility = createMessageVisibility({
 });
 const hiddenMessageCount = computed(() => messageVisibility.items.value.length);
 provide(MESSAGE_VISIBILITY, messageVisibility);
-provide(WORK_MOTION, {capture: captureWorkMotion, restore: restoreWorkMotion, finish: finishWorkMotion});
+provide(WORK_MOTION, {capture: captureWorkMotion, restore: restoreWorkMotion, finish: finishWorkMotion, reveal: revealWorkSummary});
 const isLocalConversation = computed(() => String(props.conversationUuid || "").startsWith("local:"));
 const modelMutationCounts = ref(new Map());
 function modelMutationKey(conversationUuid = activeConversationUuid.value, folderId = props.folderId) {
@@ -1016,7 +1029,7 @@ function revealExpandedDetails(details) {
 		window.requestAnimationFrame(() => {
 			const scrollContainer = scroller.value;
 			if (!scrollContainer || !details.isConnected || !details.open || !scrollContainer.contains(details)) return;
-			const scrollerRect = scrollContainer.getBoundingClientRect();
+			const scrollerRect = scrollerViewportRect(scrollContainer);
 			const detailsRect = details.getBoundingClientRect();
 			const availableHeight = Math.max(0, scrollerRect.height - DETAILS_REVEAL_MARGIN_PX);
 			const reducedMotion = Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
@@ -1166,6 +1179,20 @@ async function answerPendingConfirmation(item, answer = {}) {
 		confirmationSubmitting.value = nextSubmitting;
 	}
 }
+
+const attachmentDragActive = ref(false);
+const attachmentDropBlockedReason = computed(() => running.value ? "运行中暂不能添加附件"
+	: contextEditorOpen.value ? "请先关闭上下文编辑器再添加附件" : "");
+const attachmentDrop = createAttachmentDropHandlers({
+	onFiles(files) {
+		files.forEach(addAttachment);
+		void focusComposer();
+	},
+	onWarning: message => ElMessage.warning(message),
+	setActive: active => { attachmentDragActive.value = active; },
+	blockedReason: () => attachmentDropBlockedReason.value,
+});
+watch(() => props.conversationUuid, attachmentDrop.reset);
 
 function addAttachment(file) {
 	const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -1944,12 +1971,6 @@ function usageSum(a = {}, b = {}) {
 	};
 }
 
-function weightedAvg(aValue, aWeight, bValue, bWeight) {
-	const total = Number(aWeight || 0) + Number(bWeight || 0);
-	if (!total) return Number(bValue || aValue || 0);
-	return (Number(aValue || 0) * Number(aWeight || 0) + Number(bValue || 0) * Number(bWeight || 0)) / total;
-}
-
 function taskWallDurationMs(task = {}) {
 	const direct = Number(task?.durationMs || task?.duration_ms || 0);
 	if (direct > 0) return direct;
@@ -1987,8 +2008,6 @@ function reconcileStatsWithAgentCards(turn, stats) {
 
 function combineControllerAndAgentStats(controller, current) {
 	if (!controller || !current) return current || controller || null;
-	const leftOk = Number(controller.modelOk || controller.modelCalls || 0);
-	const rightOk = Number(current.modelOk || current.modelCalls || 0);
 	const totalDuration = Number(controller.durationMs || 0) + Number(current.durationMs || 0);
 	const usage = usageSum(controller.usage, current.usage);
 	const expertUsage = usageSum(controller.expertUsage, current.expertUsage);
@@ -2012,9 +2031,7 @@ function combineControllerAndAgentStats(controller, current) {
 		usage,
 		expertUsage,
 		costUsd: Number(controller.costUsd || 0) + Number(current.costUsd || 0),
-		avgConnectMs: weightedAvg(controller.avgConnectMs, leftOk, current.avgConnectMs, rightOk),
-		avgFirstTokenMs: weightedAvg(controller.avgFirstTokenMs, leftOk, current.avgFirstTokenMs, rightOk),
-		avgTotalMs: weightedAvg(controller.avgTotalMs, leftOk, current.avgTotalMs, rightOk),
+		...combineTimingStats(controller, current),
 		avgTps: totalDuration > 0 ? outputForTps * 1000 / totalDuration : Number(current.avgTps || controller.avgTps || 0),
 		peakTps: Math.max(Number(controller.peakTps || 0), Number(current.peakTps || 0)),
 		minTps: positiveMin.length ? Math.min(...positiveMin) : 0,
@@ -2104,7 +2121,6 @@ function statsForTurn(turn, modelRows, toolRows) {
 	const totalMs = models.reduce((sum, row) => sum + Number(row.total_time_ms || 0), 0);
 	const positiveMinTps = models.map((row) => Number(row.min_tps || 0)).filter((n) => n > 0);
 	const expertToolCalls = models.reduce((sum, row) => sum + Number(row.expert_tool_calls || 0), 0);
-	const okDen = modelOk || modelCalls;
 	const lastContext = Number(last.last_input_tokens || 0) + Number(last.last_cache_read_tokens || 0) + Number(last.last_cache_write_tokens || 0)
 		|| (Number(last.model_call_count || 0) <= 1 ? Number(last.input_tokens || 0) + Number(last.cache_read_tokens || 0) + Number(last.cache_write_tokens || 0) : 0);
 	const model = last.model || chatState.value?.model || "";
@@ -2121,9 +2137,7 @@ function statsForTurn(turn, modelRows, toolRows) {
 		toolCalls: tools.length + expertToolCalls,
 		contextTokens: lastContext,
 		contextWindow: Number(meta?.contextWindow || 0),
-		avgConnectMs: okDen ? models.reduce((sum, row) => sum + Number(row.connect_ms || 0), 0) / okDen : 0,
-		avgFirstTokenMs: okDen ? models.reduce((sum, row) => sum + Number(row.first_token_ms || 0), 0) / okDen : 0,
-		avgTotalMs: okDen ? totalMs / okDen : 0,
+		...timingStatsFromRows(models),
 		avgTps: totalMs > 0 ? usageRows.outputTokens * 1000 / totalMs : 0,
 		peakTps: Math.max(0, ...models.map((row) => Number(row.peak_tps || 0))),
 		minTps: positiveMinTps.length ? Math.min(...positiveMinTps) : 0,
@@ -2653,6 +2667,7 @@ function scrollerAtBottom(el = scroller.value) {
 function updateScrollerOverflow() {
 	const el = scroller.value;
 	scrollerOverflow.value = Boolean(el && el.scrollHeight > el.clientHeight + SCROLL_BOTTOM_THRESHOLD);
+	scrollerAwayFromBottom.value = Boolean(el && !scrollerAtBottom(el));
 }
 
 function markUserScrollIntent() {
@@ -2718,14 +2733,30 @@ function restoreMobileViewportAnchor(snapshot) {
 
 // Read every turn's viewport box once; the anchor policy and the active-turn
 // policy both need the same geometry.
+function scrollerViewportRect(el) {
+	const rect = el.getBoundingClientRect();
+	const column = el.closest?.('.conversation-column')?.getBoundingClientRect();
+	const top = Math.max(rect.top, column?.top ?? rect.top);
+	return {top, bottom: rect.bottom, height: rect.bottom - top, left: rect.left, right: rect.right, width: rect.width};
+}
+
 function scrollerTurnBoxes(el) {
-	const scrollerRect = el.getBoundingClientRect();
+	const scrollerRect = scrollerViewportRect(el);
 	const nodes = Array.from(el.querySelectorAll(".turn-block[data-turn-index]"));
 	const rows = nodes.map((node) => {
 		const rect = node.getBoundingClientRect();
 		return {node, index: Number(node.dataset.turnIndex || 0), top: rect.top, bottom: rect.bottom};
 	});
 	return {scrollerRect, rows};
+}
+
+function revealWorkSummary(element) {
+	const scroll = scroller.value;
+	if (!scroll || !element || autoScrollLocked.value || !scroll.contains(element)) return;
+	const viewport = scrollerViewportRect(scroll);
+	const summary = element.getBoundingClientRect();
+	if (summary.top >= viewport.top + 12 && summary.bottom <= viewport.bottom - 12) return;
+	runProgrammaticScroll(() => { scroll.scrollTop += summary.top - viewport.top - 12; }, 400);
 }
 
 // Height animation preserves either the reading character or, when that
@@ -2784,7 +2815,7 @@ function applyReadingAnchor(anchor) {
 		if (Number(anchor.index) >= 0) {
 			const node = el.querySelector(`.turn-block[data-turn-index="${Number(anchor.index)}"]`);
 			if (node) {
-				const scrollerRect = el.getBoundingClientRect();
+				const scrollerRect = scrollerViewportRect(el);
 				const rect = node.getBoundingClientRect();
 				const contentDelta = transcriptContentAnchorDelta(anchor.content, node, scrollerRect);
 				el.scrollTop += contentDelta ?? ((rect.top - scrollerRect.top) - Number(anchor.offset || 0));
@@ -2842,6 +2873,7 @@ function observeScrollerReflow() {
 	scrollerResizeObserver = new ResizeObserver(() => {
 		const target = scroller.value;
 		if (!target) return;
+		updateScrollerOverflow();
 		const width = Math.round(target.clientWidth);
 		// The first callback only establishes the baseline. Height-only changes
 		// (composer growth, keyboard) already own their own restore paths.
@@ -4143,6 +4175,40 @@ watch(() => props.conversationUuid, async (next, prev) => {
 	await switchConversation(next, prev);
 }, {immediate: false});
 
+// Apply after the draft's folder defaults are loaded: the card's model is a
+// one-off choice for this draft (never a global default), and nothing is sent.
+let appliedRecommendationNonce = 0;
+async function applyRecommendationDraft(request) {
+	if (!request || request.nonce === appliedRecommendationNonce || !isLocalConversation.value) return;
+	appliedRecommendationNonce = request.nonce;
+	await loadOptions();
+	// A folder change may start another defaults load; apply only after it settles.
+	for (let attempt = 0; attempt < 5; attempt++) {
+		await ensureLocalRunDefaults().catch(() => {});
+		const pending = localDefaultsLoading;
+		if (!pending) break;
+		await pending.promise.catch(() => {});
+	}
+	if (!isLocalConversation.value) return;
+	const model = modelOptions.value.find((item) => item.key === request.model);
+	if (model) {
+		localDefaultsOverrides = {...localDefaultsOverrides, mainModel: model.key};
+		applyLocalRunDefaults({...completeLocalRunConfig(), mainModel: model.key, mainThinkingLevel: ""});
+		resetLocalConversationState(String(props.conversationUuid || "local:new"));
+	}
+	restoringDraft.value = true;
+	draft.value = String(request.text || "");
+	setDraftForConversation(props.conversationUuid, draft.value);
+	await nextTick();
+	restoringDraft.value = false;
+	adjustComposerHeight();
+	emit("recommendation-draft-applied");
+	await focusComposer();
+}
+watch(() => [props.recommendationDraft, props.conversationUuid, props.folderId], ([request]) => {
+	if (request && componentMounted) void applyRecommendationDraft(request);
+});
+
 watch(() => props.folderId, (next, prev) => {
 	if (next === prev || !isLocalConversation.value) return;
 	if (outboundSends.current?.conversationUuid === activeConversationUuid.value) leavePendingSend();
@@ -4214,6 +4280,7 @@ onMounted(async () => {
 	// applied before remote state, so no temporary model placeholder can render.
 	await loadOptions();
 	await load({scrollMode: "bottom", refreshDefaults: isLocalConversation.value});
+	if (props.recommendationDraft) await applyRecommendationDraft(props.recommendationDraft);
 	adjustComposerHeight();
 	observeScrollerReflow();
 	await nextTick();
@@ -4275,9 +4342,12 @@ onBeforeUnmount(() => {
 				:cost-text="totalCostDisplay"
 			>
 				<template #mobile-navigation><slot name="mobile-navigation"/></template>
+				<template #mobile-recommendations><slot name="mobile-recommendations"/></template>
 				<template #mobile-actions>
 					<MobileConversationTools
 						:conversation-uuid="activeConversationUuid"
+						:conversation-path="props.conversationPath"
+						:running="running"
 						:token-parts="totalTokenParts"
 						:duration-text="totalDurationDisplay"
 						:cost-text="totalCostDisplay"
@@ -4296,7 +4366,18 @@ onBeforeUnmount(() => {
 			</ConsoleHeader>
 
 			<div class="console-workspace min-h-0 flex-1">
-				<div class="conversation-column min-w-0">
+				<div class="conversation-column min-w-0"
+					@dragenter.capture="attachmentDrop.dragEnter"
+					@dragover.capture="attachmentDrop.dragOver"
+					@dragleave.capture="attachmentDrop.dragLeave"
+					@drop.capture="attachmentDrop.drop"
+					@dragend.capture="attachmentDrop.reset">
+					<div v-if="attachmentDragActive" class="attachment-drop-hint" :class="{'is-blocked': attachmentDropBlockedReason}" role="status" aria-live="polite">
+						<div class="attachment-drop-label">
+							<strong>{{ attachmentDropBlockedReason || '松开以添加附件' }}</strong>
+							<span v-if="!attachmentDropBlockedReason">图片和文件将加入待发送列表</span>
+						</div>
+					</div>
 					<div v-if="searchReturnPosition" class="search-return-bar" role="status">
 					<span>{{ searchLocating ? '正在定位历史消息…' : '正在阅读搜索定位内容' }}</span>
 					<button type="button" @click="returnFromSearch">返回原位置</button>
@@ -4339,7 +4420,7 @@ onBeforeUnmount(() => {
 					</div>
 				</div>
 				
-				<div v-else class="conversation-timeline-shell mx-auto py-5">
+				<div v-else ref="timelineContent" class="conversation-timeline-shell mx-auto py-5">
 					<TurnList
 						:turns="turns"
 						:conversation-uuid="activeConversationUuid"
@@ -4360,6 +4441,9 @@ onBeforeUnmount(() => {
 				</div>
 			</div>
 			
+			<div v-if="scrollerAwayFromBottom && !contextEditorOpen" class="scroll-bottom-dock">
+				<button type="button" class="scroll-bottom-button" aria-label="回到最新消息" title="回到最新消息" @click.stop="returnToLatestFromSearch"><ArrowDown aria-hidden="true"/></button>
+			</div>
 			<MessageVisibilityBar v-show="!contextEditorOpen"/>
 			<ConversationSearch :conversation-uuid="activeConversationUuid" v-model:open="searchOpen" @locate="locateSearchResult"/>
 			<ContextEditor v-if="!isLocalConversation" ref="contextEditor" :conversation-uuid="activeConversationUuid" :busy="running" @open-change="contextEditorOpen = $event" @created="emit('conversation-created', $event.conversationUuid)"/>
@@ -4506,6 +4590,7 @@ onBeforeUnmount(() => {
 	--bear-muted: var(--ob-text-subtle);
 	--bear-paper: var(--ob-surface);
 	--bear-line: var(--ob-border);
+	--console-header-height: 66px;
 	--console-content-max-width: 56rem;
 	--console-content-gutter: 1rem;
 	--console-float-rail-right: 1.15rem;
@@ -4530,6 +4615,8 @@ onBeforeUnmount(() => {
 	position: relative;
 	display: flex;
 	min-width: 0;
+	margin-top: calc(-1 * var(--console-header-height));
+	padding-top: var(--console-header-height);
 	overflow: hidden;
 }
 
@@ -4545,7 +4632,39 @@ onBeforeUnmount(() => {
 	transition: width .24s cubic-bezier(.22, 1, .36, 1);
 }
 
+.attachment-drop-hint {
+	position: absolute;
+	inset: .75rem;
+	z-index: 45;
+	display: grid;
+	place-items: center;
+	pointer-events: none;
+	border: 2px dashed rgb(var(--ob-blue-rgb) / .65);
+	border-radius: 16px;
+	background: rgb(var(--ob-blue-rgb) / .06);
+}
+
+.attachment-drop-label {
+	display: grid;
+	gap: .35rem;
+	max-width: calc(100% - 2rem);
+	padding: 1rem 1.5rem;
+	border: 1px solid var(--ob-border);
+	border-radius: 12px;
+	background: var(--ob-surface-raised);
+	box-shadow: var(--ob-shadow-panel);
+	text-align: center;
+	color: var(--ob-text);
+	font-size: 14px;
+}
+
+.attachment-drop-label span { color: var(--ob-text-subtle); font-size: 12px; }
+.attachment-drop-hint.is-blocked { border-color: var(--ob-text-muted); }
+
 .console-scroll {
+	margin-top: calc(-1 * var(--console-header-height));
+	padding-top: var(--console-header-height);
+	scroll-padding-top: calc(var(--console-header-height) + 12px);
 	background: var(--ob-chat-bg);
 	overflow-x: hidden;
 }
@@ -4586,6 +4705,13 @@ onBeforeUnmount(() => {
 	max-width: var(--console-content-max-width);
 	overflow: visible;
 }
+
+.scroll-bottom-dock { position: absolute; left: 50%; bottom: calc(var(--console-composer-height, 135px) + 12px); z-index: 24; transform: translateX(-50%); pointer-events: none; }
+.scroll-bottom-button { display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 1px solid var(--ob-chat-border); border-radius: 50%; background: rgb(var(--ob-surface-rgb) / .88); color: var(--ob-chat-text); box-shadow: 0 4px 18px rgb(var(--ob-shadow-rgb) / .12); -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px); cursor: pointer; pointer-events: auto; }
+.scroll-bottom-button svg { width: 19px; height: 19px; }
+.scroll-bottom-button:hover { background: var(--ob-surface); }
+.scroll-bottom-button:focus-visible { outline: 2px solid var(--ob-focus); outline-offset: 3px; }
+.console-page.visibility-overlay-active .scroll-bottom-dock { display: none; }
 
 .scroll-lock-toggle {
 	position: fixed;
@@ -4665,7 +4791,7 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 760px) {
-	.console-page { --console-content-gutter: 1rem; }
+	.console-page { --console-header-height: calc(60px + env(safe-area-inset-top, 0px)); --console-content-gutter: 1rem; }
 	/* Selection adds scroll clearance; a scrollbar must not rewrap the text. */
 	.console-scroll { scrollbar-gutter: stable; }
 	.console-page.visibility-overlay-active .conversation-timeline-shell { padding-bottom: 96px; }

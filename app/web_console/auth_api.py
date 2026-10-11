@@ -26,7 +26,7 @@ def _notification_return_target(value: str) -> str:
     if "\\" in value or any(ord(char) <= 32 or ord(char) == 127 for char in value):
         return ""
     parts = urlsplit(value)
-    if parts.scheme or parts.netloc or parts.path not in {"/chat", "/settings"}:
+    if parts.scheme or parts.netloc or parts.path not in {"/chat", "/settings", "/recommendations"}:
         return ""
     return parts.path + (f"?{parts.query}" if parts.query else "")
 

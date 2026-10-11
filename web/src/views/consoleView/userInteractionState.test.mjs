@@ -58,25 +58,28 @@ test("recommendation never preselects an ordinary choice", () => {
 	assert.deepEqual(draft.selectedIndexes, []);
 });
 
-test("authorization select makes its no-execution meaning explicit only when text is present", () => {
+test("authorization select offers amended approval while ordinary answers stay unchanged", () => {
 	const draft = {selectedIndexes: [0], text: "先别执行"};
-	assert.equal(interactionPrimaryActionLabel({...selectItem, requiresAuthorization: true}, draft), "提交意见（不执行原操作）");
+	assert.equal(interactionPrimaryActionLabel({...selectItem, requiresAuthorization: true}, draft), "按补充内容确认执行");
 	assert.equal(interactionPrimaryActionLabel({...selectItem, requiresAuthorization: false}, draft), "提交回答");
 	assert.equal(interactionPrimaryActionLabel({...selectItem, requiresAuthorization: true}, draft, true), "提交中…");
 });
 
-test("confirm text is always feedback and never authorization", () => {
+test("confirm button explicitly approves amendments while a separate button only submits feedback", () => {
 	const draft = createInteractionDraft({action: "confirm"});
 	draft.text = "先备份，不要立刻重启";
-	assert.equal(interactionPrimaryActionLabel({action: "confirm", confirmText: "确认重启"}, draft), "提交意见（不执行原操作）");
+	assert.equal(interactionPrimaryActionLabel({action: "confirm", confirmText: "确认重启"}, draft), "按补充内容确认执行");
 	assert.equal(interactionRejectActionLabel(draft), "拒绝并提交说明（不执行）");
 	assert.deepEqual(buildInteractionAnswer({action: "confirm"}, draft, "confirm"), {
 		cancelled: false,
-		decision: "feedback",
+		decision: "confirm_with_changes",
 		selectedDecision: "confirm",
 		text: "先备份，不要立刻重启",
-		confirmed: false,
+		confirmed: true,
 	});
+	assert.equal(buildInteractionAnswer({action: "confirm"}, draft, "feedback").decision, "feedback");
+	assert.equal(buildInteractionAnswer({action: "confirm"}, draft, "feedback").confirmed, false);
+	assert.equal(buildInteractionAnswer({action: "confirm"}, draft, "reject").decision, "reject");
 	assert.equal(hasSubmittedInteractionText(" "), false, "whitespace is used only to judge emptiness");
 });
 

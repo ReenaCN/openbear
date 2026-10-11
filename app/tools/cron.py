@@ -1,4 +1,6 @@
 """Main-controller Cron tool; actor identity comes from the host, not parameters."""
+from pathlib import Path
+
 from pydantic import ValidationError
 
 from app.cron.contracts import CronError, JobConfig
@@ -10,6 +12,7 @@ from app.webhooks.repository import one
 
 ACTIONS = ('describe', 'list', 'get', 'create', 'update', 'delete', 'set_enabled', 'run', 'stop', 'runs', 'statistics', 'preview')
 READ = {'describe', 'list', 'get', 'runs', 'statistics', 'preview'}
+GUIDANCE = (Path(__file__).resolve().parents[2] / 'prompts' / 'guides' / 'cron.md').read_text(encoding='utf-8')
 
 
 async def dispatch(s, action, params, ctx):
@@ -23,7 +26,7 @@ async def dispatch(s, action, params, ctx):
     if not conversation: raise CronError('host_identity_required', status=403)
     owner = conversation['owner_chat_id']
     if action == 'describe':
-        return {'actions': list(ACTIONS), 'configSchema': JobConfig.model_json_schema(by_alias=True),
+        return {'actions': list(ACTIONS), 'guidance': GUIDANCE, 'configSchema': JobConfig.model_json_schema(by_alias=True),
             'contracts': {
                 'list': {'folderId': 'optional; omitted = all directories', 'folders': 'true returns available directories', 'limit': '1..100', 'offset': '0-based'},
                 'get': {'jobId': 'required'},
@@ -56,8 +59,9 @@ async def dispatch(s, action, params, ctx):
         if previous is not None:
             return previous
         if ctx.web_confirm is None: raise CronError('user_confirmation_unavailable', status=403)
-        prepared = await s.delete_impact(owner, job_id, body)
+        prepared = await s.delete_impact(owner, job_id, body, tool_approval=True)
         answer = await ctx.web_confirm({'_sourceTool': 'Cron', '_requiresAuthorization': True,
+            '_approvalScope': prepared['approvalScope'], '_approvalConstraints': prepared['approvalConstraints'],
             'title': '删除定时任务', 'body': '停用并删除定义；保留执行记录及会话，当前执行继续。\n'+dumps(prepared['impact']),
             'type': 'warning', 'confirmText': '删除此任务', 'cancelText': '取消', 'timeoutSeconds': 300})
         if not answer.get('confirmed') or answer.get('text') or answer.get('feedback'):
@@ -74,6 +78,6 @@ def register_cron_tool(registry, service):
             return ToolOutcome(dumps(exc.payload), 'failed', 'not_started')
         except (ValidationError, ValueError, TypeError) as exc:
             return ToolOutcome(dumps({'code': 'invalid_parameters', 'message': str(exc)}), 'failed', 'not_started')
-    registry.add('Cron', 'Manage authorized directory schedules. Each run starts a new conversation; no catch-up or queue. Use describe for contracts. set_enabled controls future scheduling; run starts once; stop reuses conversation stop. Owner identity is host-supplied.',
+    registry.add('Cron', 'Manage authorized directory schedules. Each run starts a new conversation; no catch-up or queue. Call describe before create/update; it returns the contract and design guidance. set_enabled controls future scheduling; run starts once; stop reuses conversation stop. Owner identity is host-supplied. Amended delete receipts keep the same job and revision; existing runs may finish, but new/replacement active runs require fresh confirmation.',
         {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': list(ACTIONS)}, 'params': {'type': 'object'}}, 'required': ['action'], 'additionalProperties': False},
         handler, visibility={'main'}, effect_scope='scheduled_task')

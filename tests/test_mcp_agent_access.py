@@ -202,7 +202,8 @@ async def test_refresh_updates_full_schema_and_agent_create_continue_without_rec
     second = await call(env, "AgentContinue", {"to": first["agentSession"]["sessionUuid"], "prompt": "Use the new source enum", "tools": [tool]}, registry=old_registry)
     assert second["status"] == "completed", second
     schema = next(t for t in env.backend.calls[-2]["tools"] if t["name"] == tool)
-    assert schema["description"] == raw_tool(version=2)["description"]
+    assert schema["description"].split("\nOpenBear MCP transport deadline:", 1)[0] == raw_tool(version=2)["description"]
+    assert "Tool timeout arguments cannot extend this limit" in schema["description"]
     assert schema["parameters"] == raw_tool(version=2)["inputSchema"]
     assert name(env, "new_search") not in {t["name"] for t in env.backend.calls[-2]["tools"]}
     assert len(events(env)) == 2

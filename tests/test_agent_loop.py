@@ -1237,13 +1237,34 @@ async def test_persist_single_round_no_tools():
 
 
 async def test_no_progress_halt():
-    """连续重复同样工具调用且无文本 → 打转熔断。"""
+    """连续重复同样工具调用且无文本：第 N 次后提醒一次，仍重复到 2N 次才熔断。"""
     repeat = [StreamEvent(kind="tool_call", tool_calls=[ToolCall(id="c", name="echo", arguments='{"x":"a"}')]),
               StreamEvent(kind="finish", finish_reason="tool_calls")]
     backend = FakeBackend([repeat])  # 永远重复同一轮
     agent = Agent(backend, _echo_registry(), no_progress_rounds=3)
     r = await agent.run([{"role": "user", "content": "loop"}], RecordRenderer(), model="m")
     assert r.halted_reason == "no_progress"
+    assert len(backend.seen_convos) == 6
+    reminded = [i for i, convo in enumerate(backend.seen_convos)
+                if any("repeat-call-notice" in str(m.get("content")) for m in convo)]
+    assert reminded and reminded[0] == 3
+    assert "repeat-call-notice" in str(backend.seen_convos[3][-1]["content"])
+    assert sum("repeat-call-notice" in str(m.get("content")) for m in backend.seen_convos[-1]) == 1
+
+
+async def test_repeated_wait_continues_after_model_explains():
+    """分段等待后台任务：提醒后模型说明在等什么，计数清零，可以继续等。"""
+    wait = [StreamEvent(kind="tool_call", tool_calls=[ToolCall(id="w", name="echo", arguments='{"x":"wait"}')]),
+            StreamEvent(kind="finish", finish_reason="tool_calls")]
+    explained = [StreamEvent(kind="content", text="在等第 13 次重跑，约 10 分钟。"),
+                 StreamEvent(kind="tool_call", tool_calls=[ToolCall(id="w", name="echo", arguments='{"x":"wait"}')]),
+                 StreamEvent(kind="finish", finish_reason="tool_calls")]
+    final = [StreamEvent(kind="content", text="跑完了"), StreamEvent(kind="finish", finish_reason="stop")]
+    backend = FakeBackend([wait] * 3 + [explained] + [wait] * 4 + [final])
+    r = await Agent(backend, _echo_registry(), no_progress_rounds=3).run(
+        [{"role": "user", "content": "等它跑完"}], RecordRenderer(), model="m")
+    assert r.halted_reason == ""
+    assert r.text == "跑完了"
 
 
 async def test_no_progress_halt_closes_pending_tool_calls():
@@ -1254,11 +1275,13 @@ async def test_no_progress_halt_closes_pending_tool_calls():
     r = await Agent(backend, _echo_registry(), no_progress_rounds=1).run(
         [{"role": "user", "content": "loop"}], RecordRenderer(), model="m", persister=pers)
 
+    # N=1：第 1 次照常执行并提醒，第 2 次中止，未执行的那批补占位结果
     assert r.halted_reason == "no_progress"
-    assert len(pers.assistants) == 1
-    assert len(pers.tools) == 1
-    assert pers.tools[0][0] == "c"
-    assert MISSING_TOOL_RESULT_TEXT in pers.tools[0][2]
+    assert len(pers.assistants) == 2
+    assert len(pers.tools) == 2
+    assert pers.tools[0][2] == "echo:a"
+    assert pers.tools[1][0] == "c"
+    assert MISSING_TOOL_RESULT_TEXT in pers.tools[1][2]
 
 
 async def test_soft_stop_closes_unexecuted_tool_calls():
@@ -2128,3 +2151,18 @@ async def test_reasoning_only_stop_still_retries_when_not_truncated():
     r = await agent.run([{"role": "user", "content": "hi"}], RecordRenderer(), model="m")
     assert r.text == "想好了"
     assert r.model_calls == 2
+
+
+async def test_timing_sample_counts_track_only_observed_successful_controller_stages():
+    backend = FakeBackend([
+        [StreamEvent("metrics", connect_ms=12),
+         StreamEvent("tool_call", tool_calls=[ToolCall(id="e", name="echo", arguments='{"text":"hi"}')]),
+         StreamEvent("finish", finish_reason="tool_calls")],
+        [StreamEvent("content", text="done"), StreamEvent("finish", finish_reason="stop")],
+    ])
+    result = await Agent(backend, _echo_registry()).run(
+        [{"role": "user", "content": "test"}], RecordRenderer(), model="fake")
+    assert result.model_ok == 2
+    assert result.connect_samples == 1
+    assert result.first_token_samples == 2
+    assert result.connect_ms_sum == 12

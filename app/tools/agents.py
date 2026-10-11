@@ -18,6 +18,7 @@ from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 
+from app.agent.progress_watch import ProgressWatch
 from app.config import Config
 from app.db.dao import MessageDAO
 from app.llm.events import Usage
@@ -490,6 +491,8 @@ class AgentTools(AgentContinuationTools):
         effective_protocol = str(detail.get("protocol") or protocol)
         cost = max(0.0, float(detail.get("costUsd") or 0.0))
         duration_ms = max(0, int(detail.get("durationMs") or 0))
+        connect_ms = max(0, int(detail.get("connectMs") or 0))
+        first_token_ms = max(0, int(detail.get("firstTokenMs") or 0))
         status = str(detail.get("status") or "ok")
         ledger_usage: dict[str, Any]
         async with self.dao.db.accounting_transaction() as connection:
@@ -501,6 +504,8 @@ class AgentTools(AgentContinuationTools):
                 commit=False,
                 last_usage=usage,
                 last_cost_usd=cost,
+                connect_ms=connect_ms,
+                first_token_ms=first_token_ms,
                 total_time_ms=duration_ms,
                 run_total_time_ms=duration_ms,
                 run_model_calls=1,
@@ -514,6 +519,8 @@ class AgentTools(AgentContinuationTools):
                 model_calls=1,
                 model_ok=1 if status == "ok" else 0,
                 model_fail=0 if status == "ok" else 1,
+                connect_ms_sum=connect_ms,
+                first_token_ms_sum=first_token_ms,
                 total_time_ms_sum=duration_ms,
                 output_tokens_sum=usage.output_tokens,
             )
@@ -533,6 +540,8 @@ class AgentTools(AgentContinuationTools):
                 usage=usage,
                 last_usage=usage,
                 cost_usd=call_cost,
+                connect_ms=connect_ms,
+                first_token_ms=first_token_ms,
                 total_time_ms=duration_ms,
                 peak_tps=max(0.0, float(detail.get("tps") or 0.0)),
                 min_tps=max(0.0, float(detail.get("tps") or 0.0)),
@@ -1219,6 +1228,7 @@ class AgentTools(AgentContinuationTools):
                 self.config.tools.tool_result_max_chars,
             ),
             **self._model_retry_kwargs(task_uuid),
+            progress_watch=ProgressWatch.from_config(self.config.agent, agent=True),
             model_call_limit=self._model_call_limit_for(agent),
             tool_call_limit=self._tool_call_limit_for(agent),
             plan_control_call_limit=int(getattr(self.config.agents, "plan_control_call_limit", 200) or 200),
@@ -2147,6 +2157,7 @@ class AgentTools(AgentContinuationTools):
                     self.config.tools.tool_result_max_chars,
                 ),
                 **self._model_retry_kwargs(task_uuid),
+                progress_watch=ProgressWatch.from_config(self.config.agent, agent=True),
                 model_call_limit=self._model_call_limit_for(agent),
                 tool_call_limit=self._tool_call_limit_for(agent),
                 plan_control_call_limit=int(getattr(self.config.agents, "plan_control_call_limit", 200) or 200),
@@ -2332,44 +2343,28 @@ def register_agent_tools(
     register_continuation_tools(reg, tools)
     reg.add(
         "Agent",
-        "Create a NEW independent Agent instance and its first task. For another instruction to an existing instance use AgentContinue, which retains its context. The child receives only the supplied prompt, attachments, explicitly shared TaskMemory, and the granted tools; it cannot see this conversation. New tasks run directly by default without the Agent Plan protocol; use planMode=managed only for explicitly Plan-governed work. Empty tools means no business tools; runtime AgentHistory and necessary protocol tools may still be present. In Web mode this usually returns running/detached; do not poll or redo delegated work.",
+        "Create a NEW independent Agent instance and its first task; use AgentContinue to give an existing instance another task. The child sees only the prompt, attachments, shared TaskMemory, and granted tools, not this conversation; empty tools means no business tools. Usually returns running/detached; do not poll or redo the delegated work.",
         {"type": "object", "properties": {
-            "prompt": {"type": "string", "description": "Self-contained brief written from the child's point of view in plain language: the question to answer or change to make, the specific locations involved, the facts and evidence already established that must not be redone, the constraints, and what makes the work finished. Reference attachments by purpose."},
+            "prompt": {"type": "string", "description": "Self-contained brief from the child's point of view: what to answer or change, where, established facts not to redo, constraints, and what counts as finished."},
             "tools": {
                 "type": "array",
                 "items": {"type": "string", "enum": sorted(AGENT_DELEGATION_TOOL_NAMES)},
-                "description": (
-                    "Required explicit allowlist of tool names this child Agent may use, chosen minimally for this task. "
-                    "Use [] for no business tools; runtime AgentHistory and necessary protocol tools may still be present. "
-                    "Values are generated from the canonical child-Agent delegation allowlist."
-                ),
+                "description": "Complete allowlist for this child; [] means no business tools (runtime AgentHistory and protocol tools may still be present).",
             },
             "description": {"type": "string", "description": "Short task label for progress display."},
             "workerType": {"type": "string", "description": "Optional Agent preset key/name from Web Agent presets. Defaults to general-purpose."},
             "attachments": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": (
-                    "Source material the child must work from, passed in full: each item is @doc/<name>, "
-                    "@mem/<ref>, or an existing local file path. Every item's complete body is written to a "
-                    "task-local file, Read is auto-granted, and a manifest of real paths and sizes is appended "
-                    "to the prompt. Use this whenever the package depends on a document, report, or file; "
-                    "never substitute a summary or title in the prompt. @secret/ references are rejected."
-                ),
+                "description": "Full source material: @doc/<name>, @mem/<ref>, or a local file path. Each is copied to a task-local file with Read granted. Do not substitute a summary. @secret/ is rejected.",
             },
             "planMode": {
                 "type": "string",
                 "enum": [_AGENT_PLAN_MODE_DIRECT, _AGENT_PLAN_MODE_MANAGED],
                 "default": _AGENT_PLAN_MODE_DIRECT,
-                "description": (
-                    "Execution mode. direct (default) starts work immediately without Plan gates. "
-                    "managed enables the full submit/approval/progress/replan/finalize protocol and is reserved for "
-                    "explicitly requested planning/audit checkpoints, high-risk external or destructive actions, "
-                    "or genuinely dependent multi-Agent work. Task length, code complexity, repository size, and "
-                    "tool count alone never require managed mode."
-                ),
+                "description": "direct (default) runs immediately. managed adds Plan approval/progress gates; use it only when checkpoints are requested, the package includes destructive or external actions, or multi-Agent dependencies require it.",
             },
-            "inheritFromTaskUuid": {"type": "string", "description": "Optional interrupted/terminal Agent task UUID from this same conversation, valid only with planMode=managed: it injects the source task's durable Plan facts, completed steps, and evidence references into the new managed task. Direct tasks reject it; write the needed facts directly into the prompt instead."},
+            "inheritFromTaskUuid": {"type": "string", "description": "managed only: inject a prior task's durable Plan facts and evidence; it is not retained model context."},
         }, "required": ["prompt", "tools"]},
         tools.agent,
         visibility={"main", "runtime"},
@@ -2414,7 +2409,7 @@ def register_agent_tools(
     )
     reg.add(
         "AgentWait",
-        "Suspend this same main-controller root turn only when no direct foreground user work remains and scoped Agents are still active. Choose event_only to wait for an interruption/important Agent event, or review_after to schedule one model-selected aggregate review of all scoped Agents. Never use Process or Bash sleep as an Agent timer.",
+        "Suspend this same main-controller root turn only when no direct foreground user work remains and scoped Agents are still active. Choose event_only to wait for an interruption/important Agent event, or review_after to schedule one model-selected aggregate review of all scoped Agents. If the previous result says reviewPending, call again to read the next recorded page immediately, even for terminal Agents; this does not arm another wait. Never use Process or Bash sleep as an Agent timer.",
         {"type": "object", "properties": {
             "mode": {"type": "string", "enum": ["event_only", "review_after"], "description": "event_only waits without a timer; review_after wakes once after the model-selected delay unless an important event interrupts it first."},
             "reviewAfterSeconds": {"type": "number", "minimum": 10, "maximum": 86400, "description": "Required only for review_after. Choose based on task scale/risk/progress; progressively lengthen healthy reviews and shorten after intervention or stalled progress."},

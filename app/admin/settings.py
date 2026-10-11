@@ -4,6 +4,7 @@ from __future__ import annotations
 from string import Formatter
 from typing import Any
 
+from app.agent.progress_watch import render_notice, sample_variables, validate_notice_template
 from app.agents.prompts import PROMPT_SPECS, render_plan_prompt, validate_prompt_template
 from app.context.user_message_template import (
     build_message_variables,
@@ -11,6 +12,8 @@ from app.context.user_message_template import (
     validate_user_message_template,
 )
 from app.settings.specs import GROUPS, SPECS, WEB_DOMAINS, SettingSpec, get_spec
+
+_PROGRESS_PROMPTS = {"agent.progressReminder.controllerPrompt", "agent.progressReminder.agentPrompt"}
 
 _SENSITIVE_EXACT = {
     "memory.accessKey",
@@ -166,6 +169,9 @@ def validate_prompt_setting(path: str, template: str) -> None:
     if path == "userMessageTemplate.template":
         validate_user_message_template(template)
         return
+    if path in _PROGRESS_PROMPTS:
+        validate_notice_template(template)
+        return
     effective = str(template or "").strip() or spec.default_value
     if path in PROMPT_SPECS:
         validate_prompt_template(path, effective)
@@ -197,6 +203,11 @@ def preview_prompt_setting(path: str, template: str, variables: dict[str, Any] |
                 else:
                     samples[key] = value
         return render_user_message_suffix({"enabled": True, "template": template}, samples)
+    if path in _PROGRESS_PROMPTS:
+        samples = sample_variables()
+        samples.update({key.removeprefix("loop."): value for key, value in (variables or {}).items()
+                        if key.removeprefix("loop.") in samples})
+        return render_notice(template, spec.default_value, samples)
     if path in PROMPT_SPECS:
         return render_plan_prompt(path, template, variables)
     samples = {

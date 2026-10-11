@@ -2,14 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {readFileSync} from "node:fs";
 
-const panelSource = readFileSync(new URL("./TurnWorkDetailPanel.vue", import.meta.url), "utf8");
 const turnEventSource = readFileSync(new URL("./TurnEvent.vue", import.meta.url), "utf8");
 const agentCardSource = readFileSync(new URL("./AgentEventCard.vue", import.meta.url), "utf8");
 
-test("work detail requests Agent preview mode and TurnEvent forwards it to every Agent card", () => {
-	const workEventMarkup = panelSource.match(/<TurnEvent[\s\S]*?\/>/)?.[0] || "";
-	assert.match(workEventMarkup, /:agent-preview-only="true"/);
-	assert.match(workEventMarkup, /:compact="true"/);
+test("TurnEvent forwards Agent preview mode to every Agent card", () => {
 	assert.match(turnEventSource, /:compact="props\.compact"/);
 
 	const agentCardMarkups = [...turnEventSource.matchAll(/<AgentEventCard[\s\S]*?\/>/g)].map((match) => match[0]);

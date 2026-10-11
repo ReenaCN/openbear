@@ -80,6 +80,8 @@ const ACTION_META = {
 function confirmDecision(result, summary) {
 	const sources = [result, summary].filter((source) => source && typeof source === "object");
 	if (sources.some((source) => text(source.decision || source.choice).trim().toLowerCase() === "feedback")) return "feedback";
+	if (sources.some((source) => source.decision === "confirm_with_changes")) return "confirm_with_changes";
+	if (sources.some((source) => source.decision === "reject")) return "reject";
 	if (sources.some((source) => text(source.text).trim().length > 0)) return "feedback";
 	for (const source of sources) {
 		const decision = text(source.decision || source.choice).trim().toLowerCase();
@@ -107,6 +109,9 @@ function outcome(action, status, result, sensitive, summary = {}) {
 	if (status === "interrupted") return {key: "interrupted", label: "已中断", tone: "muted"};
 	if (status === "timeout") return {key: "timeout", label: "已超时", tone: "warning"};
 	if (status === "error") return {key: "error", label: "出错", tone: "danger"};
+	if ([result, summary].some((source) => source.decision === "confirm_with_changes")) {
+		return {key: "confirmed_with_changes", label: "已授权 · 按补充内容执行", tone: "success"};
+	}
 	if (action === "confirm") {
 		const decision = confirmDecision(result, summary);
 		if (decision === "feedback") return {key: "feedback", label: "已反馈", tone: "info"};
@@ -129,6 +134,7 @@ function introFor(action, outcomeValue) {
 	if (outcomeValue.key === "interrupted") return `本次${ACTION_META[action].name}因运行中断未完成`;
 	if (["cancelled", "rejected"].includes(outcomeValue.key)) return `用户未继续本次${ACTION_META[action].name}`;
 	if (outcomeValue.key === "feedback") return "用户已提交意见，未授权执行原操作";
+	if (outcomeValue.key === "confirmed_with_changes") return "用户已授权按补充内容修订后执行";
 	if (outcomeValue.key === "error") return `本次${ACTION_META[action].name}未能完成`;
 	return `用户已完成本次${ACTION_META[action].name}`;
 }
@@ -229,10 +235,10 @@ export function buildUserInteractionView(input = {}) {
 		redactedText: REDACTED_TEXT,
 		source: responseSource,
 		sourceLabel: responseSource === "telegram" ? "Telegram" : (responseSource === "web" ? "网页" : ""),
-		confirmed: !sensitive && outcomeValue.key === "confirmed",
+		confirmed: !sensitive && ["confirmed", "confirmed_with_changes"].includes(outcomeValue.key),
 		confirmText: action === "confirm" && !sensitive ? text(result.text) : "",
 		selectedDecision,
-		selectedDecisionLabel: selectedDecision === "confirm" ? "确认执行" : (selectedDecision === "reject" ? "拒绝" : ""),
+		selectedDecisionLabel: selectedDecision === "confirm_with_changes" ? "按补充内容确认执行" : selectedDecision === "confirm" ? "确认执行" : (selectedDecision === "reject" ? "拒绝" : ""),
 		promptValue: action === "prompt" && !sensitive ? text(result.value) : "",
 		selectText: action === "select" && !sensitive ? text(result.text) : "",
 		answerMode: action === "select" && !sensitive ? text(result.answerMode) : "",

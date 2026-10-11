@@ -30,10 +30,10 @@ function css(sfc, selector, width) {
   });
   return output;
 }
-function runtime(phone = true) {
+function runtime(phone = true, inlineActions = false) {
   const mounted = [], unmounted = [], events = [], listeners = new Map();
   const context = vm.createContext({...Vue,
-    defineProps: () => ({title:'记忆管理', subtitle:'条目统计', description:'使用说明'}),
+    defineProps: () => ({title:'记忆管理', subtitle:'条目统计', description:'使用说明', inlineActions}),
     defineEmits: () => (...args) => events.push(args),
     useId: () => 'test', useAdminPhone: () => Vue.ref(phone),
     onMounted: fn => mounted.push(fn), onBeforeUnmount: fn => unmounted.push(fn),
@@ -100,6 +100,18 @@ test('rendered phone disclosure has explicit state and does not duplicate contro
     await r.run('toggleMore()'); view = await render(header.template.content, scope);
     assert.match(view.html, /aria-expanded="true"/); assert.equal(extra().dirs[0].value, true);
   }
+});
+
+test('inline actions remain visible on phones without a redundant more menu', async () => {
+  const r = runtime(true, true);
+  const scope = Vue.proxyRefs(r.run('({props,isPhone,root,moreButton,actions,moreOpen,actionsId,toggleMore,closeMore,closeAfterAction,closeOnFocusLeave})'));
+  scope.$slots = {actions: () => [Vue.h('button', '刷新'), Vue.h('button', '全部已读')]};
+  const view = await render(header.template.content, scope);
+  assert.doesNotMatch(view.html, /class="admin-header-more"/);
+  assert.match(view.html, /has-inline-actions/);
+  assert.equal(view.nodes.find(n => n.props?.class === 'admin-header-actions').dirs[0].value, true);
+  assert.equal((view.html.match(/>刷新</g) || []).length, 1);
+  assert.equal((view.html.match(/>全部已读</g) || []).length, 1);
 });
 
 test('all five pages forward navigation/readiness and retain existing primary, refresh and toggle handlers', async () => {

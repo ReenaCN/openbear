@@ -93,7 +93,7 @@ export function draftEnvironment() {
     cleanup() {for (const timer of timers) clearTimeout(timer); frames.clear();}};
 }
 
-export async function mountDraftConsole(env, uuid) {
+export async function mountDraftConsole(env, uuid, extraProps = {}) {
   const module = {exports: {}};
   const context = vm.createContext({module, exports: module.exports, require, __env: env, ...env.globals,
     console, performance, AbortController, File, Blob, URL, structuredClone, crypto: globalThis.crypto});
@@ -102,7 +102,7 @@ export async function mountDraftConsole(env, uuid) {
   const container = {};
   let vnode;
   const update = conversationUuid => {
-    vnode = vue.h(component, {conversationUuid, folderId: ''});
+    vnode = vue.h(component, {conversationUuid, folderId: '', ...extraProps});
     renderer.render(vnode, container);
   };
   update(uuid);

@@ -325,32 +325,42 @@ def canonical_answer(item: dict[str, Any], body: Any, *, source: str) -> tuple[d
             selectedLabels=[option["label"] for _, option in selected],
             text=text, answerMode=answer_mode([option["value"] for _, option in selected], text),
         )
+        if item.get("requiresAuthorization"):
+            decision = body.get("decision", "feedback" if text else "confirm")
+            if not isinstance(decision, str) or decision not in {"confirm", "confirm_with_changes", "feedback"}:
+                errors.append({"path": "decision", "message": "invalid authorization decision"})
+            if decision == "confirm_with_changes" and (not text or not selected):
+                errors.append({"path": "text", "message": "请选择授权选项并填写补充内容。"})
+            result["decision"] = decision if decision == "confirm_with_changes" else "feedback" if text else decision
     else:
         text = _text(body, "text", errors)
         if "confirmed" in body and not isinstance(body["confirmed"], bool):
             errors.append({"path": "confirmed", "message": "confirmed must be a boolean"})
         decision = body.get("decision") or ("confirm" if body.get("confirmed") is True else "feedback" if text else "reject")
-        if not isinstance(decision, str) or decision not in {"confirm", "reject", "feedback"}:
-            errors.append({"path": "decision", "message": "decision must be confirm, reject or feedback"})
+        if not isinstance(decision, str) or decision not in {"confirm", "confirm_with_changes", "reject", "feedback"}:
+            errors.append({"path": "decision", "message": "decision must be confirm, confirm_with_changes, reject or feedback"})
             decision = "feedback"
         selected_decision = body.get("selectedDecision", decision)
-        if not isinstance(selected_decision, str) or selected_decision not in {"confirm", "reject", "feedback"}:
+        if not isinstance(selected_decision, str) or selected_decision not in {"confirm", "confirm_with_changes", "reject", "feedback"}:
             errors.append({"path": "selectedDecision", "message": "invalid selected decision"})
             selected_decision = decision
-        if decision == "feedback" and not text:
+        if decision in {"feedback", "confirm_with_changes"} and not text:
             errors.append({"path": "text", "message": "请填写你的意见。"})
-        # Never interpret natural language as authorization, even alongside a yes.
-        effective = "feedback" if text else decision
+        # Only the new explicit button grants amended approval. Legacy yes+text
+        # remains feedback; a rejection remains a rejection even with a reason.
+        effective = "feedback" if text and decision == "confirm" else decision
         result.update(
-            confirmed=effective == "confirm", decision=effective,
-            choice="confirm" if effective == "confirm" else "feedback" if effective == "feedback" else "cancel",
+            confirmed=effective in {"confirm", "confirm_with_changes"}, decision=effective,
+            choice=effective if effective in {"confirm", "confirm_with_changes", "feedback"} else "cancel",
             selectedDecision=selected_decision, text=text,
-            label="已提交意见（未执行原操作）" if effective == "feedback" else item.get("confirmText") if effective == "confirm" else item.get("cancelText"),
+            label="已授权 · 按补充内容执行" if effective == "confirm_with_changes" else "已提交意见（未执行原操作）" if effective == "feedback" else item.get("confirmText") if effective == "confirm" else item.get("cancelText"),
         )
-    if item.get("requiresAuthorization"):
-        result["authorizationGranted"] = not text and (result.get("confirmed") is True or (action == "select" and bool(result.get("selectedValues"))))
-        if text:
-            result["decision"] = "feedback"
+    if result.get("decision") == "confirm_with_changes":
+        result.update(authorizationGranted=True, requiresAmendment=True,
+                      authorizationScope="original_request_with_user_changes",
+                      instruction="用户已明确授权按附言修订后执行。先落实全部附言，不得执行冲突的旧方案；不要仅因附言重复确权。只有实质歧义或超出授权范围时才询问。")
+    elif item.get("requiresAuthorization"):
+        result["authorizationGranted"] = not text and result.get("decision") != "feedback" and (result.get("confirmed") is True or (action == "select" and bool(result.get("selectedValues"))))
     if len(json.dumps(result, ensure_ascii=False, separators=(",", ":"))) > MAX_RESULT_CHARS:
         errors.append({"path": "answer", "message": f"回答过长（总计最多 {MAX_RESULT_CHARS} 字符），请缩短后提交；原文未被截断。"})
     return result, errors
@@ -359,7 +369,7 @@ def canonical_answer(item: dict[str, Any], body: Any, *, source: str) -> tuple[d
 def redact_result(result: dict[str, Any]) -> dict[str, Any]:
     """Redact every answer-bearing field while retaining only lifecycle metadata."""
     out = copy.deepcopy(result)
-    for key in ("value", "text", "freeText", "defaultValue"):
+    for key in ("value", "text", "freeText", "defaultValue", "appliedConditions"):
         if key in out:
             out[key] = REDACTED
     for key in ("selectedValues", "selectedLabels", "selectedIndexes"):
@@ -414,6 +424,7 @@ def explicit_authorization(result: dict[str, Any]) -> bool:
         and result.get("status", "answered") == "answered"
         and result.get("cancelled") is not True
         and not str(result.get("text") or "").strip()
-        and result.get("decision") not in {"feedback", "reject", "cancel"}
+        and result.get("decision") not in {"feedback", "reject", "cancel", "confirm_with_changes"}
+        and not result.get("requiresAmendment")
         and result.get("authorizationGranted") is not False
     )

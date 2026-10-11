@@ -33,7 +33,7 @@ REFERENCE_LINK = re.compile(r"\[((?:\\.|[^\[\]\\\n])*)\]\((openbear://ref/[^\s)]
 # linkify bare URLs, or recursively parse image alt text as explicit references.
 REFERENCE_MARKDOWN = MarkdownIt("default", {"html": False, "linkify": False})
 BUNDLE_FIELD = "openbear_reference_bundle"
-KINDS = {"mem", "doc", "secret", "chat", "turn", "message"}
+KINDS = {"mem", "doc", "secret", "chat", "turn", "message", "rec"}
 MAX_REFERENCES = 30
 MENTION_NOTICE = "仅提及：仅提供名称和定位，未提供正文；不表示要求读取。"
 
@@ -72,6 +72,8 @@ def reference_from_url(url: str, label: str = "") -> dict | None:
             not re.fullmatch(r"[1-9][0-9]*", identity) or int(identity) > 9223372036854775807
         ):
             return None
+        if kind == "rec" and not re.fullmatch(r"[0-9a-fA-F-]{8,64}", identity):
+            return None
         if kind in {"turn", "message"} and (len(parts) != 3 or not parts[2]):
             return None
         if kind not in {"turn", "message"} and len(parts) != 2:
@@ -98,6 +100,29 @@ def reference_from_url(url: str, label: str = "") -> dict | None:
         return ref
     except (ValueError, TypeError):
         return None
+
+
+def recommendation_material(row) -> str:
+    """A recommendation card's follow-up material, as context for a new conversation."""
+    sources = json.loads(row["sources_json"] or "[]")
+    location = json.loads(row["location_json"] or "{}")
+    lines = [
+        "这是 OpenBear 推荐模块生成的一张推荐卡片及其续聊资料，是背景材料，不是用户的话。",
+        f"标题：{row['title']}",
+        f"卡片正文：{row['body']}",
+    ]
+    if row["reason"]:
+        lines.append(f"为什么推荐：{row['reason']}")
+    to_check = json.loads(row["to_check_json"] or "[]") if "to_check_json" in row.keys() else []
+    if to_check:
+        lines.append("推荐模块没能确认、需要先核对的：" + "；".join(to_check))
+    if sources:
+        lines.append("来源：" + "；".join(f"{item.get('title')} {item.get('url')}" for item in sources))
+    if location.get("conversationUuid"):
+        lines.append(f"原话题会话：{location['conversationUuid']}（可用 History 读取）")
+    if row["material"]:
+        lines.extend(("", "续聊资料：", row["material"]))
+    return "\n".join(lines)
 
 
 def reference_key(ref: dict) -> str:
@@ -288,6 +313,13 @@ class ReferenceMaterials:
         self._cipher_instance = Fernet(key_path.read_bytes())
         return self._cipher_instance
 
+    async def _recommendation_card(self, ref: dict, *, owner: int):
+        cursor = await self.db.conn.execute(
+            "SELECT * FROM rec_cards WHERE card_id=? AND owner_chat_id=? AND removed_at_ms IS NULL",
+            (ref["id"], owner),
+        )
+        return await cursor.fetchone()
+
     async def _mention_metadata(self, ref: dict, *, owner: int) -> tuple[str, dict]:
         """Resolve identity and visibility, never fetch a resource's body.
 
@@ -297,6 +329,11 @@ class ReferenceMaterials:
         """
         unavailable = ReferenceError("reference_unavailable", ref["label"], key=ref["key"])
         kind = ref["kind"]
+        if kind == "rec":
+            row = await self._recommendation_card(ref, owner=owner)
+            if row is None:
+                raise unavailable
+            return str(row["title"] or ref["label"]), {"tool": "Recommendation", "cardId": ref["id"]}
         if kind in {"mem", "doc", "secret"}:
             queries = {
                 "mem": "SELECT e.id,e.title,e.ref,e.enabled,e.archived FROM memory_entries e JOIN memory_categories c ON c.id=e.category_id WHERE e.id=?",
@@ -418,7 +455,13 @@ class ReferenceMaterials:
                 by_requested[original["key"]] = public
                 materials.append(material)
                 continue
-            if ref["kind"] in {"mem", "doc", "secret"}:
+            if ref["kind"] == "rec":
+                row = await self._recommendation_card(ref, owner=owner)
+                if row is None:
+                    raise ReferenceError("reference_unavailable", ref["label"], key=ref["key"])
+                label = str(row["title"] or ref["label"])
+                content = recommendation_material(row)
+            elif ref["kind"] in {"mem", "doc", "secret"}:
                 resource = "entry" if ref["kind"] == "mem" else ref["kind"]
                 result = await memory.tool_call(resource, {"action": "get", "id": int(ref["id"])})
                 item = result.get("item") or {}

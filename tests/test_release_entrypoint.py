@@ -151,9 +151,153 @@ def test_changed_candidate_invalidates_validation_but_preserves_old_evidence(git
     assert (directory / "superseded" / first["localCommit"] / "assets/old.zip").read_bytes() == b"original"
 
 
-@pytest.mark.parametrize("path", ["data/openbear.db", "../secret", "/absolute", "web/node_modules/x", "web/dist/index.html", ".env", "app/__pycache__/x.pyc"])
+@pytest.mark.parametrize("path", ["data/openbear.db", "../secret", "/absolute", "web/node_modules/x", "web/dist/index.html", ".env", "app/__pycache__/x.pyc", "evals", "evals/replay.py", "evals/prompt_regression/runs/result.json"])
 def test_runtime_and_private_paths_never_become_public_candidate(path):
     assert not candidate.valid_path(path)
+
+
+def _stage_local_only_removal(repo, name):
+    target = repo / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("local fixture\n")
+    subprocess.run(["git", "add", "-f", "--", name], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "legacy local fixture"], cwd=repo, check=True, capture_output=True)
+    with (repo / ".gitignore").open("a") as stream:
+        stream.write("/evals/\n")
+    subprocess.run(["git", "rm", "--cached", "--", name], cwd=repo, check=True, capture_output=True)
+    return target
+
+
+@pytest.mark.parametrize("name", ["evals/local.py", "evals/中文.py", "evals/line\nbreak.py"])
+def test_candidate_accepts_only_reviewed_cached_local_removal(git_repo, name):
+    target = _stage_local_only_removal(git_repo, name)
+    directory, state, command = new_state(git_repo)
+    state.value["files"] += [".gitignore", name]
+    frozen = candidate.freeze(git_repo, directory, state, command)
+    assert name not in frozen["files"]
+    assert target.read_text() == "local fixture\n"
+    assert not command(["git", "ls-files", "--", name], "check-removed", cwd=git_repo)
+    assert candidate.freeze(git_repo, directory, state, command) == frozen
+    candidate.assert_local(git_repo, state.value, command)
+    (git_repo / "app/main.py").write_text("VALUE = 4\n")
+    updated = candidate.freeze(git_repo, directory, state, command)
+    assert updated["localCommit"] != frozen["localCommit"]
+    assert target.read_text() == "local fixture\n"
+
+
+def test_local_removal_commit_response_recovery_keeps_file(git_repo):
+    name = "evals/local.py"
+    target = _stage_local_only_removal(git_repo, name)
+    directory, state, command = new_state(git_repo)
+    state.value["files"] += [".gitignore", name]
+
+    def lose_commit_response(args, label, **kwargs):
+        result = command(args, label, **kwargs)
+        if "commit" in args:
+            raise ReleaseError("lost response")
+        return result
+
+    with pytest.raises(ReleaseError, match="lost response"):
+        candidate.freeze(git_repo, directory, state, lose_commit_response)
+    committed = command(["git", "rev-parse", "HEAD"], "head", cwd=git_repo)
+    restored = State(directory, load(directory / "state.json"))
+    frozen = candidate.freeze(git_repo, directory, restored, command)
+    assert frozen["localCommit"] == committed
+    assert name not in frozen["files"]
+    assert target.read_text() == "local fixture\n"
+
+
+def test_local_removal_must_be_reviewed_and_cannot_be_restaged(git_repo):
+    name = "evals/local.py"
+    _stage_local_only_removal(git_repo, name)
+    directory, state, command = new_state(git_repo)
+    state.value["files"] += [".gitignore"]
+    with pytest.raises(ReleaseError, match="Unreviewed changes.*evals"):
+        candidate.freeze(git_repo, directory, state, command)
+    state.value["files"].append(name)
+    command(["git", "add", "-f", "--", name], "restore-local", cwd=git_repo)
+    with pytest.raises(ReleaseError, match="unsafe or non-public"):
+        candidate.freeze(git_repo, directory, state, command)
+    assert candidate.version(git_repo) == "1.0.0"
+
+
+def test_frontend_backups_are_ignored_but_never_public(git_repo):
+    shutil.copyfile(ROOT / ".gitignore", git_repo / ".gitignore")
+    name = "web/.dist-before-fixture/index.html"
+    target = git_repo / name
+    target.parent.mkdir(parents=True)
+    target.write_text("local build")
+    subprocess.run(["git", "check-ignore", "--", name], cwd=git_repo, check=True, capture_output=True)
+    assert not candidate.valid_path(name)
+    directory, state, command = new_state(git_repo)
+    state.value["files"] += [".gitignore"]
+    assert name not in candidate.freeze(git_repo, directory, state, command)["files"]
+    assert target.read_text() == "local build"
+
+
+def test_candidate_preserves_public_special_filenames(git_repo):
+    name = "docs/中文\nname.md"
+    target = git_repo / name
+    target.parent.mkdir()
+    target.write_text("public fixture")
+    directory, state, command = new_state(git_repo)
+    state.value["files"].append(name)
+    assert candidate.freeze(git_repo, directory, state, command)["files"][name] == sha(b"public fixture")
+
+
+def test_candidate_reuse_rejects_legacy_evals_manifest(git_repo):
+    directory, state, command = new_state(git_repo)
+    frozen = candidate.freeze(git_repo, directory, state, command)
+    frozen["files"]["evals/replay.py"] = sha(b"local fixture")
+    with pytest.raises(ReleaseError, match="Frozen candidate.*evals"):
+        candidate.freeze(git_repo, directory, state, command)
+
+
+def test_candidate_reuse_rechecks_committed_public_tree(git_repo):
+    directory, state, command = new_state(git_repo)
+    frozen = candidate.freeze(git_repo, directory, state, command)
+    (git_repo / "evals").mkdir()
+    (git_repo / "evals/replay.py").write_text("local fixture")
+    command(["git", "add", "evals"], "add-local-evals", cwd=git_repo)
+    command(["git", "commit", "-m", "legacy fixture"], "legacy-commit", cwd=git_repo)
+    frozen["localCommit"] = state.value["localCandidate"] = command(["git", "rev-parse", "HEAD"], "legacy-head", cwd=git_repo)
+    # Even an incomplete saved manifest must not bypass today's tree policy.
+    with pytest.raises(ReleaseError, match="Source is not approved.*evals"):
+        candidate.freeze(git_repo, directory, state, command)
+
+
+@pytest.mark.parametrize("operation", ["export", "assert_local"])
+def test_legacy_evals_candidate_rejected_before_export_or_publication(tmp_path, operation):
+    source = tmp_path / "source"
+    source.mkdir()
+    marker = source / "evidence.txt"
+    marker.write_text("preserve old evidence")
+    value = {"candidate": {"files": {"evals/replay.py": sha(b"local fixture")}}}
+
+    def forbidden_command(*args, **kwargs):
+        pytest.fail("legacy candidate rejection must precede commands or network access")
+
+    with pytest.raises(ReleaseError, match="Frozen candidate.*evals"):
+        if operation == "export":
+            candidate.export(tmp_path, tmp_path, SimpleNamespace(value=value), forbidden_command)
+        else:
+            candidate.assert_local(tmp_path, value, forbidden_command)
+    assert marker.read_text() == "preserve old evidence"
+
+
+@pytest.mark.parametrize("extra", ["directory", "file", "broken-symlink"])
+def test_cached_public_source_rejects_extra_evals(tmp_path, extra):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "README.md").write_text("public")
+    frozen = {"files": {"README.md": sha(b"public")}}
+    assert candidate.source_matches(tmp_path, frozen)
+    if extra == "directory":
+        (tmp_path / "evals").mkdir()
+    elif extra == "file":
+        (tmp_path / "evals").write_text("local")
+    else:
+        (tmp_path / "evals").symlink_to(tmp_path / "missing")
+    assert not candidate.source_matches(tmp_path, frozen)
 
 
 def test_matrix_collection_and_skip_contract():

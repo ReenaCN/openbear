@@ -15,8 +15,8 @@ from typing import Any
 
 from app.interaction_data import redact_result
 from app.logging import get_logger
-from app.runtime.tool_result import ToolOutcome
 from app.runtime.lifecycle import current_session
+from app.runtime.tool_result import ToolOutcome
 from app.tools.json_repair import extract_balanced_json
 from app.tools.truncate import truncate_tool_result
 
@@ -179,6 +179,8 @@ class ToolRuntimeContext:
     webhook_owner_id: int = 0
     webhook_start_cursor: int | None = None
     webhook_automatic: bool = False
+    # Host-injected recommendation-run authority for the Recommendation tool.
+    recommendation_run_id: str = ""
     receipt_repair: bool = False
     receipt_repair_calls: int = 0
     receipt_repair_started: float = 0.0
@@ -230,7 +232,8 @@ class ToolRegistry:
         self.current_registry: Callable[[], ToolRegistry] | None = None
 
     def register(self, tool: Tool) -> None:
-        self._tools[tool.name] = tool
+        from app.tools.confirmation import with_amended_confirmation
+        self._tools[tool.name] = with_amended_confirmation(tool, self.mcp_tool_identities.get(tool.name))
 
     def add(self, name: str, description: str, parameters: dict[str, Any],
             handler: ToolHandler, *, visibility: set[str] | None = None,
@@ -261,6 +264,9 @@ class ToolRegistry:
         return {t.name: t.description for t in self._visible_tools(scope, source)}
 
     def schemas(self, scope: str | None = None) -> list[dict[str, Any]]:
+        if scope == "agent":
+            from app.tools.confirmation import without_approval_argument
+            return [without_approval_argument(t.schema()) for t in self._visible_tools(scope)]
         return [t.schema() for t in self._visible_tools(scope)]
 
     async def dispatch(

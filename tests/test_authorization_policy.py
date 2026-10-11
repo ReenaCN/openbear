@@ -26,19 +26,23 @@ async def test_default_policy_renders_continuity_without_relaxing_execution_gate
         }, template_content=content, source="policy-test")
         assert "[[ERROR:" not in output
         for phrase in [
-            "A standalone question, inspection, or defect report does not by itself authorize changes",
-            "During an authorized implementation and acceptance-testing cycle",
-            "Source-code authorization alone does not authorize deployment",
-            "A different tool, file, or routine technical stage is not by itself a new authorization boundary",
-            "without adding a redundant preliminary UserInteraction confirmation",
+            "A request for explanation, assessment, or inspection without a request to change the object calls for an answer, not a modification",
+            "During an authorized implementation and acceptance cycle, defect feedback asks for correction within that scope",
+            "Source-code authorization alone does not cover deployment",
+            "a different tool, file, or routine stage is not a new boundary",
+            "call that tool directly without a preliminary confirmation",
             "Never bypass the gate, fabricate authorization",
-            "Do not treat an uncertain outcome as permission to repeat a side-effecting action",
+            "An uncertain outcome is not permission to repeat a side-effecting action",
+            "`decision=feedback` grants no authority",
+            "`decision=confirm_with_changes` authorizes the proposal as amended by the user's full text",
+            "apply every condition before acting",
+            "Cancellation and timeout grant nothing",
         ]:
             assert phrase in output
         assert "preserve directory instructions" in output
         assert "workspace/artifacts/" in output
         if tools:
-            assert "confirmation response with substantive text is feedback" in output
+            assert "Do not ask a design question and then a separate execution confirmation for the same decision" in output
             assert "an assistant's confirmation habit is not a user constraint" in output
     finally:
         await db.close()
@@ -50,7 +54,8 @@ def test_tool_descriptions_remove_preconfirmation_but_keep_feedback_safety():
     register_openbear_control_tool(reg, FakeSvc())
     descriptions = reg.summaries(scope="main")
     assert "not to repeat a clear instruction or existing authorization within its scope" in descriptions["UserInteraction"]
-    assert "Confirmation feedback does not authorize the original action" in descriptions["UserInteraction"]
+    assert "decision=feedback grants no authority" in descriptions["UserInteraction"]
+    assert "decision=confirm_with_changes explicitly authorizes" in descriptions["UserInteraction"]
     assert "without a redundant UserInteraction pre-confirmation" in descriptions["OpenBearControl"]
     assert "Cancellation or timeout never authorizes execution" in descriptions["OpenBearControl"]
     assert "do not restart/stop openbear.service via Bash" in descriptions["OpenBearControl"]

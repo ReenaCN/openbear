@@ -274,7 +274,9 @@ class AnthropicBackend(LLMBackend):
         if level == "off" and not active_tool_turn:
             payload["thinking"] = {"type": "disabled"}
         elif level and level != "off":
-            payload["thinking"] = {"type": "adaptive"}
+            # Newer Claude models default thinking.display to "omitted": thinking
+            # blocks carry only the signature. Request the readable summary.
+            payload["thinking"] = {"type": "adaptive", "display": "summarized"}
             effort = api_effort(level)
             if effort:
                 payload["output_config"] = {"effort": effort}

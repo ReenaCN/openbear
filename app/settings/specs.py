@@ -10,6 +10,9 @@ from app.browser.settings import build_specs as _browser_specs
 from app.context.summary_prompt import DEFAULT_SUMMARY_PROMPT
 from app.context.user_message_template import DEFAULT_USER_MESSAGE_TEMPLATE, USER_MESSAGE_TEMPLATE_VARIABLES
 from app.conversation_titles import DEFAULT_NAMING_PROMPT
+from app.agent.progress_watch import DEFAULT_AGENT_PROMPT as DEFAULT_PROGRESS_AGENT_PROMPT
+from app.agent.progress_watch import DEFAULT_CONTROLLER_PROMPT as DEFAULT_PROGRESS_CONTROLLER_PROMPT
+from app.agent.progress_watch import VARIABLES as PROGRESS_REMINDER_VARIABLES
 from app.agents.prompts import PROMPT_SPECS
 
 SettingKind = Literal["bool", "int", "float", "str", "multi"]
@@ -133,12 +136,34 @@ SPECS: dict[str, SettingSpec] = {
     "agent.noProgressRounds": _s(
         "agent.noProgressRounds",
         "连续无进展轮数",
-        "模型连续多轮没有有效输出或工具进展时，OpenBear 会主动收敛。",
+        "模型连续这么多轮发出完全相同、不带说明的工具调用时先提醒一次；仍不说明、再重复同样轮数才中止本轮。",
         "int",
         "agent",
         "下一轮生效",
         min_value=1,
         max_value=50,
+    ),
+    "agent.progressReminder.enabled": _s(
+        "agent.progressReminder.enabled", "无推进提醒",
+        "开启后，OpenBear 监控模型的执行过程：长时间只在思考和读取、没有修改文件或执行有效操作时，在下一次请求前提醒模型重新审视状态。只提醒，不打断、不改思考档位。",
+        "bool", "progress_reminder", "下一轮生效",
+    ),
+    "agent.progressReminder.minutes": _s(
+        "agent.progressReminder.minutes", "无推进时长",
+        "从本轮开始、上次推进或用户插话起，超过这个时长仍没有推进就提醒一次，之后重新计时。等待模型重试和工具执行的时间不计入。",
+        "float", "progress_reminder", "下一轮生效", min_value=1, max_value=1440, unit="分钟",
+    ),
+    "agent.progressReminder.controllerPrompt": _s(
+        "agent.progressReminder.controllerPrompt", "主会话提醒提示词",
+        "提醒主会话模型的内容；留空使用内置模板。外层的 <long-thinking-notice> 标签由 OpenBear 自动添加。",
+        "str", "progress_reminder", "下一轮生效", editor="template",
+        variables=PROGRESS_REMINDER_VARIABLES, default_value=DEFAULT_PROGRESS_CONTROLLER_PROMPT,
+    ),
+    "agent.progressReminder.agentPrompt": _s(
+        "agent.progressReminder.agentPrompt", "Agent 提醒提示词",
+        "提醒子 Agent 的内容；留空使用内置模板。外层的 <long-thinking-notice> 标签由 OpenBear 自动添加。",
+        "str", "progress_reminder", "下一轮生效", editor="template",
+        variables=PROGRESS_REMINDER_VARIABLES, default_value=DEFAULT_PROGRESS_AGENT_PROMPT,
     ),
     "models.namingModels": _s(
         "models.namingModels", "命名模型",
@@ -812,6 +837,15 @@ GROUPS: dict[str, tuple[str, list[str]]] = {
         "agent.namingPrompt",
         ],
     ),
+    "progress_reminder": (
+        "无推进提醒",
+        [
+        "agent.progressReminder.enabled",
+        "agent.progressReminder.minutes",
+        "agent.progressReminder.controllerPrompt",
+        "agent.progressReminder.agentPrompt",
+        ],
+    ),
     "user_message_template": (
         "用户消息尾部模板",
         ["userMessageTemplate.enabled", "userMessageTemplate.template"],
@@ -949,6 +983,7 @@ WEB_DOMAINS: dict[str, tuple[str, str, list[str]]] = {
         "运行、恢复、上下文与子任务协作",
         [
             "agent",
+            "progress_reminder",
             "user_message_template",
             "retry",
             "timeouts",

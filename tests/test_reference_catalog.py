@@ -207,3 +207,36 @@ async def test_catalog_conversation_ownership_and_archive_are_independent(web_en
     assert "chat:mine" in items and "chat:archived" not in items and "chat:other" not in items
     _, items = await asyncio.to_thread(read_catalog, e.db.path, 123, True)
     assert "chat:archived" in items and "chat:other" not in items
+
+
+async def test_catalog_lists_owned_live_recommendation_cards_and_tracks_changes(web_env):
+    e = web_env
+    insert = """INSERT INTO rec_cards(card_id,owner_chat_id,run_id,lane,category,title,body,material,created_at_ms)
+                VALUES(?,?,?,?,?,?,?,?,?)"""
+    await e.db.conn.executemany(
+        insert,
+        [
+            ("aaaaaaaa-0001", 123, "run", "external", "news", "我的推荐", "正文" * 40, "MATERIAL-NOT-IN-CATALOG", 1_791_600_000_000),
+            ("bbbbbbbb-0002", 456, "run", "external", "news", "别人的推荐", "x", "", 1_791_600_000_000),
+        ],
+    )
+    await e.db.conn.commit()
+    _, items = await asyncio.to_thread(read_catalog, e.db.path, 123)
+    row = items["rec:aaaaaaaa-0001"]
+    assert (row["kind"], row["id"], row["label"], row["category"]) == ("rec", "aaaaaaaa-0001", "我的推荐", "news")
+    assert row["preview"] == ("正文" * 40)[:30] + "…" and row["updatedAt"] == 1_791_600_000
+    assert "rec:bbbbbbbb-0002" not in items and "MATERIAL-NOT-IN-CATALOG" not in json.dumps(items)
+    cur = await e.db.conn.execute("SELECT COALESCE(MAX(seq),0) FROM web_catalog_changes")
+    before = (await cur.fetchone())[0]
+    async with e.db.write_transaction(label="catalog-test") as conn:
+        await conn.execute("UPDATE rec_cards SET removed_at_ms=1 WHERE card_id='aaaaaaaa-0001'")
+    cur = await e.db.conn.execute("SELECT kind,entity_id FROM web_catalog_changes WHERE seq>?", (before,))
+    assert [tuple(r) for r in await cur.fetchall()] == [("rec", "aaaaaaaa-0001")]
+    _, items = await asyncio.to_thread(read_catalog, e.db.path, 123)
+    assert "rec:aaaaaaaa-0001" not in items
+    cur = await e.db.conn.execute("SELECT COALESCE(MAX(seq),0) FROM web_catalog_changes")
+    before = (await cur.fetchone())[0]
+    async with e.db.write_transaction(label="catalog-test") as conn:
+        await conn.execute("UPDATE rec_cards SET seen_at_ms=2,state='seen' WHERE card_id='bbbbbbbb-0002'")
+    cur = await e.db.conn.execute("SELECT COUNT(*) FROM web_catalog_changes WHERE seq>?", (before,))
+    assert (await cur.fetchone())[0] == 0

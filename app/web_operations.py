@@ -746,7 +746,7 @@ def web_event_operation_specs(event: dict[str, Any]) -> list[dict[str, Any]]:
 
     if typ == "accepted":
         task_notification = bool(event.get("taskNotification"))
-        source = "task_notification" if task_notification else (event.get("source") if event.get("source") in {"telegram", "webhook", "cron"} else "user")
+        source = "task_notification" if task_notification else (event.get("source") if event.get("source") in {"telegram", "webhook", "cron", "recommendation"} else "user")
         payload = {
             "turnId": turn_uuid,
             "runId": execution_run_uuid,
@@ -775,13 +775,14 @@ def web_event_operation_specs(event: dict[str, Any]) -> list[dict[str, Any]]:
                 "attachments": event.get("attachments") if isinstance(event.get("attachments"), list) else [],
                 **({"source": "webhook", "eventTriggered": True, "eventCard": event.get("eventCard"), "assignmentId": event.get("assignmentId")} if event.get("source") == "webhook" else {}),
                 **({"source": "cron", "eventTriggered": True, "cronRunId": event.get("cronRunId"), "cronCard": event.get("cronCard")} if event.get("source") == "cron" else {}),
+                **({"source": "recommendation", "eventTriggered": True, "recommendationRunId": event.get("recommendationRunId"), "recommendationCard": event.get("recommendationCard")} if event.get("source") == "recommendation" else {}),
                 **({"references": event["references"], "referenceBundleId": str(event.get("referenceBundleId") or "")} if event.get("references") else {}),
                 "queued": bool(event.get("queued", False)),
                 "interruption": bool(event.get("interruption") or event.get("steeringInjected")),
                 "status": str(event.get("status") or ("插话已交给主会话" if event.get("steeringInjected") else "")),
                 "createdAtMs": ts,
             },
-            status="completed", source=event.get("source") if event.get("source") in {"telegram", "webhook", "cron"} else "user",
+            status="completed", source=event.get("source") if event.get("source") in {"telegram", "webhook", "cron", "recommendation"} else "user",
         ))
         return specs
 
@@ -1056,7 +1057,8 @@ def web_event_operation_specs(event: dict[str, Any]) -> list[dict[str, Any]]:
         specs.append(_operation_spec(
             op_id=f"notice:{str(event.get('eventUuid') or event.get('eventId') or ts)}",
             op_type="notice", action="create", turn_uuid=turn_uuid,
-            payload={"text": str(event.get("text") or ""), "level": "info", "footer": str(event.get("footer") or ""), "createdAtMs": ts},
+            payload={"text": str(event.get("text") or ""), "level": "info", "footer": str(event.get("footer") or ""), "createdAtMs": ts,
+                     **({"runtimeNotice": True} if event.get("runtimeNotice") is True else {})},
             source="system",
         ))
         return specs
@@ -1354,7 +1356,7 @@ def _user_interaction_summary_payload(payload: dict[str, Any], status: str) -> d
     result_data = _summary_json_object(raw_result)
     if str(result_data.get("source") or "") in {"web", "telegram"}:
         summary["source"] = result_data["source"]
-    if str(result_data.get("decision") or "") in {"confirm", "reject", "feedback", "cancel"}:
+    if str(result_data.get("decision") or "") in {"confirm", "confirm_with_changes", "reject", "feedback", "cancel"}:
         summary["decision"] = result_data["decision"]
     if action == "confirm":
         confirmed = _user_interaction_confirmed_flag(result_data)
@@ -1453,6 +1455,27 @@ def operation_public(row: dict[str, Any], *, include_tool_details: bool = True) 
                 _user_interaction_summary_payload(payload, status)
                 if is_interaction else _tool_summary_payload(payload, status)
             )
+    elif (
+        op_type == "reasoning"
+        and not include_tool_details
+        and (payload.get("complete") or lifecycle == "terminal")
+        and (payload.get("text") or payload.get("textChunks"))
+    ):
+        # A finished reasoning row renders collapsed as name + duration only.
+        # Its full text is fetched through the detail endpoint when expanded.
+        text = payload.get("text")
+        if not isinstance(text, str):
+            chunks = payload.get("textChunks")
+            text = "".join(str(chunk) for chunk in chunks) if isinstance(chunks, list) else ""
+        public["payload"] = {
+            key: value for key, value in payload.items() if key not in {"text", "textChunks"}
+        }
+        public["payload"]["textChars"] = len(text)
+        public.update({
+            "detailAvailable": True,
+            "detailLoaded": False,
+            "detailRevision": revision,
+        })
     return public
 
 

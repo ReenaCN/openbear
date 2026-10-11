@@ -34,9 +34,18 @@ class WebAdminChatStateMixin:
     async def _chat_model_calls(self, chat_id: int, session_uuid: str) -> list[dict[str, Any]]:
         if not session_uuid:
             return []
+        # Same rows as before; only the columns the Web statistics actually read.
         cur = await self.db.conn.execute(
             """
-            SELECT * FROM model_calls
+            SELECT id, created_at, model, protocol, think_level, call_kind,
+                   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                   cost_usd, connect_ms, first_token_ms, total_time_ms, status, error_type,
+                   model_call_count, model_ok_count, model_retry_count, model_fail_count,
+                   peak_tps, min_tps,
+                   last_input_tokens, last_cache_read_tokens, last_cache_write_tokens,
+                   expert_input_tokens, expert_output_tokens,
+                   expert_cache_read_tokens, expert_cache_write_tokens, expert_tool_calls
+            FROM model_calls
             WHERE chat_id=? AND session_uuid=?
             ORDER BY created_at ASC, id ASC
             LIMIT 500
@@ -48,9 +57,10 @@ class WebAdminChatStateMixin:
     async def _chat_tool_calls(self, chat_id: int, session_uuid: str) -> list[dict[str, Any]]:
         if not session_uuid:
             return []
+        # The Web only buckets these rows by time and counts them.
         cur = await self.db.conn.execute(
             """
-            SELECT * FROM tool_calls
+            SELECT id, created_at FROM tool_calls
             WHERE chat_id=? AND session_uuid=?
             ORDER BY created_at ASC, id ASC
             LIMIT 1000
@@ -771,9 +781,11 @@ class WebAdminChatStateMixin:
         if live and duration_ms <= 0 and result.start_monotonic > 0:
             duration_ms = int((time.monotonic() - result.start_monotonic) * 1000)
         model_ok = max(0, result.model_ok + result.expert_model_calls)
-        avg_connect = result.connect_ms_sum / model_ok if model_ok else 0
-        avg_first = result.first_token_ms_sum / model_ok if model_ok else 0
-        avg_total = result.call_time_ms_sum / model_ok if model_ok else 0
+        # These sums contain successful controller attempts, not child task usage.
+        # Non-stream/absent stages remain unknown, not zero-latency samples.
+        avg_connect = result.connect_ms_sum / result.connect_samples if result.connect_samples else None
+        avg_first = result.first_token_ms_sum / result.first_token_samples if result.first_token_samples else None
+        avg_total = result.call_time_ms_sum / result.call_time_samples if result.call_time_samples else None
         avg_tps = (
             result.output_tokens_sum / (result.call_time_ms_sum / 1000)
             if result.call_time_ms_sum > 0 else 0.0
@@ -811,6 +823,9 @@ class WebAdminChatStateMixin:
             },
             "lastUsage": _usage_json(result.last_usage),
             "expertUsage": _usage_json(result.expert_usage),
+            "connectSamples": result.connect_samples,
+            "firstTokenSamples": result.first_token_samples,
+            "totalTimeSamples": result.call_time_samples,
             "avgConnectMs": avg_connect,
             "avgFirstTokenMs": avg_first,
             "avgTotalMs": avg_total,

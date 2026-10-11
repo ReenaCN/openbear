@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 from .common import ReleaseError, atomic_json, fingerprint, sha
 
 VERSION_FILES = {"app/__init__.py", "pyproject.toml", "uv.lock", "web/package.json", "web/package-lock.json"}
-PUBLIC_ROOTS = {".githooks", ".gitignore", "README.md", "README", "LICENSE", "app", "docs", "evals",
+PUBLIC_ROOTS = {".githooks", ".gitignore", "README.md", "README", "LICENSE", "app", "docs",
                 "openbear.json.example", "openbear.service", "prompts", "pyproject.toml", "scripts", "tests", "uv.lock", "web"}
 VERSION_RE = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\Z")
 
@@ -28,7 +28,7 @@ def valid_path(name: str) -> bool:
     p = PurePosixPath(name)
     return bool(name and not p.is_absolute() and ".." not in p.parts and "\\" not in name
                 and p.parts[0] in PUBLIC_ROOTS and not any(x in p.parts for x in ("__pycache__", "node_modules", ".venv", ".git"))
-                and not name.startswith(("web/dist/", "web/data/", "web/logs/", "evals/agent_delegation/reports/"))
+                and not name.startswith(("web/dist/", "web/data/", "web/logs/", "web/.dist-before-"))
                 and not name.endswith((".db", ".db-wal", ".db-shm", ".pyc")))
 
 
@@ -50,7 +50,7 @@ def changed_paths(git) -> set[str]:
 
 
 def tree_files(git) -> list[str]:
-    rows = git("ls-tree", "-r", "HEAD").splitlines()
+    rows = filter(None, git("ls-tree", "-rz", "HEAD").split("\0"))
     files = []
     for row in rows:
         header, name = row.split("\t", 1)
@@ -59,6 +59,22 @@ def tree_files(git) -> list[str]:
             raise ReleaseError(f"Source is not approved for public export: {name}")
         files.append(name)
     return files
+
+
+def assert_public_candidate(candidate: dict) -> None:
+    # Saved candidates are bound to their complete source fingerprint. Reject an
+    # old policy's private inputs rather than silently filtering a frozen tree.
+    for name in candidate["files"]:
+        if not valid_path(name):
+            raise ReleaseError(f"Frozen candidate is not approved for public export: {name}")
+
+
+def source_matches(source: Path, candidate: dict) -> bool:
+    # A cached export must not retain local evals, even outside its manifest.
+    return bool((source / ".git").is_dir()
+                and not (source / "evals").exists() and not (source / "evals").is_symlink()
+                and all(valid_path(p) and (source / p).is_file() and sha((source / p).read_bytes()) == digest
+                        for p, digest in candidate["files"].items()))
 
 
 def freeze(repo: Path, directory: Path, state, command) -> dict:
@@ -84,7 +100,13 @@ def freeze(repo: Path, directory: Path, state, command) -> dict:
         raise ReleaseError("Local HEAD changed outside this run; refusing to adopt unrelated history", code=2)
     changed = changed_paths(git)
     allowed = set(value["files"]) | VERSION_FILES
-    if any(not valid_path(p) for p in allowed):
+    deleted = set(filter(None, git("diff", "--cached", "--name-only", "--no-renames", "--diff-filter=D", "-z").split("\0")))
+    prior_removals = set(value.get("localOnlyRemovals", [])) if prior or recovered_commit else set()
+    indexed = set(filter(None, git("ls-files", "-z").split("\0")))
+    removals = {p for p in allowed & (deleted | prior_removals) if p not in indexed
+                and (p == "evals" or p.startswith("evals/"))
+                and ".." not in PurePosixPath(p).parts and "\\" not in p}
+    if any(not valid_path(p) for p in allowed - removals):
         raise ReleaseError("--files contains an unsafe or non-public path")
     if changed - allowed:
         raise ReleaseError("Unreviewed changes: " + ", ".join(sorted(changed - allowed)))
@@ -93,6 +115,8 @@ def freeze(repo: Path, directory: Path, state, command) -> dict:
     if prior and not changed and not recovered_commit:
         if version(repo) != value["version"]:
             raise ReleaseError("Local release version drifted")
+        assert_public_candidate(value["candidate"])
+        tree_files(git)  # Reapply the current public policy before stage reuse.
         return value["candidate"]
     current_version = version(repo)
     if not prior:
@@ -103,8 +127,11 @@ def freeze(repo: Path, directory: Path, state, command) -> dict:
         raise ReleaseError("Corrective candidate must keep this run's version")
     command([value["python"], str(repo / "scripts/bump_version.py"), "--check", "--expect", value["version"]], "check-version", cwd=repo)
     if not recovered_commit:
-        git("add", "--all", "--", *sorted(allowed))
-        staged = set(git("diff", "--cached", "--name-only").splitlines())
+        git("add", "--all", "--", *sorted(allowed - removals))
+        staged = set(filter(None, git("diff", "--cached", "--name-only", "--no-renames", "-z").split("\0")))
+        remaining = set(filter(None, git("ls-files", "-z").split("\0")))
+        if removals & remaining:
+            raise ReleaseError("Local-only removal was replaced by staged content")
         if staged - allowed:
             raise ReleaseError("Index contains unrelated changes")
         if not staged:
@@ -112,6 +139,7 @@ def freeze(repo: Path, directory: Path, state, command) -> dict:
         hook = repo / ".githooks/pre-commit"
         if hook.is_file() and git("config", "--get", "core.hooksPath", check=False) != ".githooks":
             command(["bash", str(hook)], "pre-commit-hook", cwd=repo)
+        value["localOnlyRemovals"] = sorted(removals)
         value["commitIntent"] = {"parent": current, "tree": git("write-tree")}
         state.save()
         git("-c", "user.name=OpenBear Release", "-c", "user.email=release@openbear.invalid", "commit", "-m", f"release: prepare {value['version']}")
@@ -143,6 +171,7 @@ def freeze(repo: Path, directory: Path, state, command) -> dict:
 def export(repo: Path, directory: Path, state, command) -> dict:
     value, source = state.value, directory / "source"
     candidate = value["candidate"]
+    assert_public_candidate(candidate)  # Before deleting a cache or fetching public history.
     if source.exists():
         if source.is_symlink():
             raise ReleaseError("Public source directory cannot be a symlink")
@@ -170,7 +199,7 @@ def export(repo: Path, directory: Path, state, command) -> dict:
         for member in tar:
             if member.isdir():
                 continue
-            if not member.isreg() or member.name not in candidate["files"]:
+            if not member.isreg() or not valid_path(member.name) or member.name not in candidate["files"]:
                 raise ReleaseError(f"Unsafe exported file: {member.name}")
             target = source / member.name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -192,6 +221,7 @@ def export(repo: Path, directory: Path, state, command) -> dict:
 
 
 def assert_local(repo: Path, value: dict, command):
+    assert_public_candidate(value["candidate"])
     current = command(["git", "rev-parse", "HEAD"], "check-head", cwd=repo)
     if current != value["candidate"]["localCommit"]:
         raise ReleaseError("Local HEAD changed after validation", code=2)

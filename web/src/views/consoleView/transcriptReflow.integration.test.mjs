@@ -206,6 +206,27 @@ test('C06: the same character inside a long paragraph stays on screen through na
   }
 });
 
+test('glass-covered rows are excluded from anchors and visible text survives reflow', () => {
+  const el = longTranscript(), h = harness(el);
+  const column = {getBoundingClientRect: () => ({top: 66})};
+  el.closest = () => column;
+  el.scrollTop = 170;
+  assert.equal(h.run('captureScrollAnchor().index'), 1, 'the preceding turn ends behind the header');
+  el.scrollTop = 1200;
+  h.run('updateActiveTurnFromScroll()');
+  const offset = h.run('readingAnchor.content.offset'), top = characterTop(el, offset);
+  assert.ok(top >= 66, 'the captured line is below the glass');
+  for (const width of [990, 1440]) {
+    el.clientWidth = width;
+    h.run('compensateTranscriptReflow()');
+    assert.equal(characterTop(el, offset), top);
+    assert.equal(h.run('readingAnchor.content.offset'), offset);
+  }
+  column.getBoundingClientRect = () => ({top: 60});
+  h.run('applyReadingAnchor(readingAnchor)');
+  assert.equal(characterTop(el, offset), top - 6, 'header resize preserves the offset from the readable viewport');
+});
+
 test('the observer only reacts to width and coalesces one reflow into a single frame', () => {
   const el = scroller(1440, turns);
   const h = harness(el);

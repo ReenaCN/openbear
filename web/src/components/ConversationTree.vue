@@ -32,6 +32,8 @@ import {
 const props = defineProps({
   activeConversationUuid: { type: String, default: "" },
   draftConversation: { type: Object, default: null },
+  // Off while a page that must keep its own route (e.g. recommendations) is shown.
+  autoOpenSelected: { type: Boolean, default: true },
 });
 const emit = defineEmits(["open", "new-conversation", "rows", "selected-folder", "refresh-list", "delete-conversation", "folder-removed", "conversation-properties"]);
 
@@ -702,7 +704,8 @@ async function refreshTree({
       }
       for (const runningItem of data.running?.items || []) cacheLocatedConversation(runningItem);
       if (selectedItem) cacheLocatedConversation(selectedItem);
-      if (!props.activeConversationUuid && selectedItem?.conversationUuid) emit("open", selectedItem);
+      if (!props.autoOpenSelected) { /* keep the current page */ }
+      else if (!props.activeConversationUuid && selectedItem?.conversationUuid) emit("open", selectedItem);
       else if (!props.activeConversationUuid && !selectedItem && !activeCount.value) emit("new-conversation", "");
       if (selectedItem && !selectedItem.archived) selectFolder(String(selectedItem.folderId || ""));
     } else {
@@ -1638,6 +1641,7 @@ onBeforeUnmount(() => {
             <button class="tree-node-main" type="button" :class="{ 'is-folder-target': (row.kind === 'folder' && selectedFolderId === row.folderId) || (row.kind === 'system' && row.systemNode === 'temporary' && selectedFolderId === '') }" :title="row.path || row.name" @click="row.search ? locateAndOpen(row) : activateRow(row)" @contextmenu="openMenu($event, row)">
               <el-icon class="node-icon" :class="{ 'is-spinning': rowLoading(row) }"><component :is="rowLoading(row) ? Loading : row.kind === 'system' ? (row.systemNode === 'archive' ? Box : ChatLineRound) : (isExpanded(row.folderId) ? FolderOpened : Folder)" /></el-icon>
               <span class="node-label">{{ row.name }}</span>
+              <span v-if="row.managedBy === 'recommendations'" class="node-managed" title="由推荐功能管理" aria-label="由推荐功能管理"><el-icon><MagicStick /></el-icon></span>
               <span v-if="row.pinned" class="node-star" title="同级置顶"><el-icon><StarFilled /></el-icon></span>
               <span class="node-count" :aria-label="`${row.kind === 'system' ? row.count : Number(row.conversationCount || 0)} 个会话`">{{ row.kind === 'system' ? row.count : Number(row.conversationCount || 0) }}</span>
             </button>
@@ -1689,7 +1693,7 @@ onBeforeUnmount(() => {
             <button role="menuitem" @click="runMenuAction('cron')"><el-icon><Timer /></el-icon><span>定时任务</span></button>
             <button role="menuitem" @click="runMenuAction('properties')"><el-icon><InfoFilled /></el-icon><span>目录属性</span></button>
             <hr />
-            <button class="danger" role="menuitem" @click="runMenuAction('delete-folder')"><el-icon><Delete /></el-icon><span>删除目录</span></button>
+            <button class="danger" role="menuitem" :disabled="menu.row?.managedBy === 'recommendations'" :title="menu.row?.managedBy === 'recommendations' ? '由推荐功能管理，在推荐设置里关闭推荐后可删除' : ''" @click="runMenuAction('delete-folder')"><el-icon><Delete /></el-icon><span>{{ menu.row?.managedBy === 'recommendations' ? '删除目录（先关闭推荐）' : '删除目录' }}</span></button>
           </template>
           <template v-else-if="['system', 'root'].includes(menu.row?.kind)">
             <button v-if="menu.row?.systemNode === 'temporary' || menu.row?.kind === 'root'" role="menuitem" @click="runMenuAction('new-conversation')"><el-icon><ChatLineRound /></el-icon><span>新建临时会话</span></button>
@@ -1891,6 +1895,7 @@ onBeforeUnmount(() => {
 <style>
 .tree-menu-shield { position:fixed; inset:0; z-index:3200; background:transparent; }
 .tree-context-menu { font-family:inherit; font-size:12px; font-weight:400; line-height:1.4; position:fixed; width:min(194px,calc(100vw - 16px)); max-height:calc(100vh - 16px); overflow:auto; padding:5px; border:1px solid rgb(var(--ob-border-rgb) / .11); border-radius:10px; background:rgb(var(--ob-surface-raised-rgb) / .97); color:var(--ob-text); box-shadow:var(--ob-shadow-popover); backdrop-filter:blur(18px) saturate(1.3); }
+.node-managed { display:inline-flex; flex:none; color:var(--ob-text-muted); font-size:12px; }
 .tree-context-menu button { font:inherit; display:grid; grid-template-columns:16px 1fr; align-items:center; gap:7px; width:100%; min-height:28px; padding:4px 8px; border:0; border-radius:7px; background:transparent; color:inherit; text-align:left; cursor:pointer; }
 @media (max-width:760px), (hover:none) and (pointer:coarse) {
   .tree-context-menu { max-height:calc(var(--mobile-viewport-height, 100dvh) - 16px); }

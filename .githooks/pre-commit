@@ -14,29 +14,23 @@ fail() {
     exit 1
 }
 
-staged_files=$(git diff --cached --name-only --diff-filter=ACM)
-if [ -z "$staged_files" ]; then
+staged_list=$(mktemp "${TMPDIR:-/tmp}/openbear-pre-commit.XXXXXX")
+blob=""
+trap 'rm -f -- "$staged_list"; if [ -n "$blob" ]; then rm -f -- "$blob"; fi' EXIT
+# NUL 保留任意文件名；取消改名识别，检查新目标但允许仅删除。
+git diff --cached --name-only --no-renames --diff-filter=ACMT -z >"$staged_list"
+if [ ! -s "$staged_list" ]; then
     exit 0
 fi
 
-SENSITIVE_FILES=(
-    "openbear.json"
-    "openbear.json.tmp"
-    ".env"
-    "state.db"
-    "state.db-wal"
-    "state.db-shm"
-)
-
-for sf in "${SENSITIVE_FILES[@]}"; do
-    if echo "$staged_files" | grep -qxF "$sf"; then
-        fail "$sf 是敏感运行时文件，不能提交（样板请用 openbear.json.example）"
-    fi
-done
-
-while IFS= read -r f; do
-    [ -z "$f" ] && continue
+while IFS= read -r -d '' f; do
     case "$f" in
+        evals|evals/*)
+            fail "$f 属于仅本机保留的 evals，不能提交"
+            ;;
+        openbear.json|openbear.json.tmp|.env|state.db|state.db-wal|state.db-shm)
+            fail "$f 是敏感运行时文件，不能提交（样板请用 openbear.json.example）"
+            ;;
         openbear.json.bak*|*.env|*.env.*|.env.*|*.db|*.db-wal|*.db-shm)
             fail "$f 匹配敏感文件通配规则"
             ;;
@@ -44,7 +38,7 @@ while IFS= read -r f; do
             fail "$f 属于本应 ignore 的运行时目录"
             ;;
     esac
-done <<< "$staged_files"
+done <"$staged_list"
 
 patterns=(
     'sk-ant-api0[A-Za-z0-9_-]{20,}'
@@ -63,31 +57,35 @@ patterns=(
     'eyJhbGciOi[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'
 )
 
+# 读取暂存 blob 到私有临时文件；不把 NUL 放进 Bash 字符串，也不让
+# grep -q/head 提前关闭管道，使 pipefail 把真实命中误判为失败。
+blob=$(mktemp "${TMPDIR:-/tmp}/openbear-pre-commit.XXXXXX")
 hits=0
-while IFS= read -r f; do
-    [ -z "$f" ] && continue
+while IFS= read -r -d '' f; do
     case "$f" in
         openbear.json.example|.githooks/pre-commit)
             continue
             ;;
     esac
-    if ! git show ":$f" >/dev/null 2>&1; then
+    if ! git show ":$f" >"$blob" 2>/dev/null; then
+        fail "无法读取 $f 的暂存内容，未完成凭证检查"
+    fi
+    # read 的空 delimiter 表示 NUL：找到 NUL 才成功，普通文本到 EOF 返回非零。
+    if IFS= read -r -d '' binary_probe <"$blob"; then
+        unset binary_probe
         continue
     fi
-    if git show ":$f" | grep -q $'\0'; then
-        continue
-    fi
-    content=$(git show ":$f" 2>/dev/null || true)
-    [ -z "$content" ] && continue
+    unset binary_probe
     for pat in "${patterns[@]}"; do
-        if echo "$content" | grep -E -e "$pat" -q; then
-            matched=$(echo "$content" | grep -E -e "$pat" -o | head -3)
+        if LC_ALL=C grep -E -e "$pat" -q -- "$blob"; then
+            # sed 读完整个流，不使用会提前退出、触发 SIGPIPE 的 head。
+            matched=$(LC_ALL=C grep -E -e "$pat" -o -- "$blob" | sed -n '1,3p')
             echo "${RED}[pre-commit] 在 $f 中命中敏感模式：${RESET}" >&2
-            echo "$matched" | sed 's/\(.\{12\}\).*\(.\{4\}\)$/  \1…\2/' >&2
+            printf '%s\n' "$matched" | sed 's/\(.\{12\}\).*\(.\{4\}\)$/  \1…\2/' >&2
             hits=$((hits + 1))
         fi
     done
-done <<< "$staged_files"
+done <"$staged_list"
 
 if [ "$hits" -gt 0 ]; then
     fail "共命中 $hits 处潜在凭证。确认是误报才可用 git commit --no-verify。"

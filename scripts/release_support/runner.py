@@ -400,7 +400,7 @@ class Runner:
             candidate.freeze(self.repo, self.directory, self.state, self.command)
             identity = self.value["candidate"]
             self.state.execute("source", identity["sourceFingerprint"], lambda: candidate.export(self.repo, self.directory, self.state, self.command),
-                valid=lambda result: (self.directory / "source/.git").is_dir() and all((self.directory / "source" / p).is_file() and sha((self.directory / "source" / p).read_bytes()) == digest for p, digest in identity["files"].items()))
+                valid=lambda result: candidate.source_matches(self.directory / "source", identity))
             previous = self.state.execute("previous-assets", self.value["previous"]["id"], self.previous_assets,
                 valid=lambda result: asset_metadata(self.directory / "previous-assets", result["assets"]))
             self.value["scope"] = self.state.execute("scope", {"candidate": identity["sourceFingerprint"],

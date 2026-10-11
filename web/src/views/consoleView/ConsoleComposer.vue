@@ -953,7 +953,7 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 								<span>{{ ensureInteractionDraft(item).selectedIndexes.length ? '补充、限制或修正以上选择' : '也可以不选，直接填写自己的答案' }}</span>
 								<textarea :value="ensureInteractionDraft(item).text" rows="2" :disabled="interactionDisabled(item)"
 								          placeholder="写下更符合你需要的答案" @input="setInteractionText(item, $event.target.value)"></textarea>
-								<small v-if="item.requiresAuthorization">有文字时只提交意见，不执行原操作。</small>
+								<small v-if="item.requiresAuthorization">可按补充内容确认执行，也可仅提交意见。附言授权仅限本次操作。</small>
 							</label>
 						</template>
 						<label v-else-if="interactionAction(item) === 'prompt'" class="web-interaction-input">
@@ -963,10 +963,10 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 							<small v-if="item.sensitive">此输入会原样提交给当前任务，不会显示在公开历史中。</small>
 						</label>
 						<label v-else class="web-interaction-input confirm-feedback-input">
-							<span>补充意见（可选）</span>
+							<span>补充或修改（可选）</span>
 							<textarea :value="ensureInteractionDraft(item).text" rows="2" :disabled="interactionDisabled(item)"
 							          placeholder="如需调整原操作，请在这里说明" @input="setInteractionText(item, $event.target.value)"></textarea>
-							<small>填写任何意见后都不会执行原操作；意见将原样提交。</small>
+							<small>确认时将按补充内容执行；如尚未决定，请选择“仅提交意见”。</small>
 						</label>
 						<div v-if="interactionError(item)" class="interaction-submit-error" role="alert">{{ interactionError(item) }}</div>
 						<div class="web-confirm-actions">
@@ -974,6 +974,9 @@ defineExpose({focus, adjustHeight, openFilePicker, focusInteraction, getReferenc
 							        @click="answerInteraction(item, 'cancel')">{{ item.cancelText || '暂不回答' }}</button>
 							<button v-if="interactionAction(item) === 'confirm'" type="button" class="web-confirm-btn reject"
 							        :disabled="interactionDisabled(item)" @click="answerInteraction(item, 'reject')">{{ confirmRejectLabel(item) }}</button>
+							<button v-if="(interactionAction(item) === 'confirm' || (item.requiresAuthorization && ensureInteractionDraft(item).selectedIndexes.length)) && ensureInteractionDraft(item).text.trim()"
+							        type="button" class="web-confirm-btn cancel" :disabled="interactionDisabled(item)"
+							        @click="answerInteraction(item, 'feedback')">仅提交意见，暂不执行</button>
 							<button type="button" class="web-confirm-btn confirm" :disabled="interactionDisabled(item)"
 							        :aria-busy="props.confirmationSubmitting[item.confirmationId] ? 'true' : 'false'"
 							        @click="answerInteraction(item, 'confirm')">

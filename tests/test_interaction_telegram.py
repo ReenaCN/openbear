@@ -279,7 +279,7 @@ async def test_created_is_immediate_and_network_failure_retries_without_touching
 
 
 @pytest.mark.asyncio
-async def test_confirm_text_is_feedback_and_never_boolean_authorization(db, config, capture):
+async def test_legacy_submit_with_text_remains_feedback_not_boolean_authorization(db, config, capture):
     current = item("confirm-1", "confirm")
     interactions = FakeInteractions(current)
     transport = InteractionTelegram(config, db, capture.bot, interactions)
@@ -345,7 +345,8 @@ async def test_authorization_select_keeps_choice_and_text_and_labels_submit_as_f
     assert draft
     markup = transport._root_keyboard(current, draft, allow_reply=True)
     button_texts = [button.text for row in markup.inline_keyboard for button in row]
-    assert "提交意见（不执行原操作）" in button_texts
+    assert "仅提交意见，暂不执行" in button_texts
+    assert "按补充内容确认执行" in button_texts
 
     await click(transport, capture, draft["callback_token"], "submit", root["telegram_message_id"])
     submitted = interactions.submissions[0][2]

@@ -552,6 +552,8 @@ class MCPManager:
                 if decision in {"conversation", "always"}:
                     self._grant_conversation(meta, context)
                 persist_trust = decision == "always"
+                if decision == "amendments_required":
+                    return _json({"status": "amendments_required", "outcome": "not_started", "confirmation": confirmation})
                 if decision not in {"once", "conversation", "always"}:
                     log.info("mcp.tool.confirm_denied", server=meta.server_key, tool=meta.original_tool_name)
                     await record_audit(self.db, "mcp.tool.denied", actor=_actor(context), chat_id=context.chat_id, detail={"server": meta.server_key, "tool": meta.original_tool_name, "reason": "user_denied"})
@@ -599,7 +601,12 @@ class MCPManager:
         except TimeoutError:
             log.warning("mcp.tool.timeout", server=meta.server_key, tool=meta.original_tool_name)
             await record_audit(self.db, "mcp.tool.failed", actor=_actor(context), chat_id=context.chat_id, detail={"server": meta.server_key, "tool": meta.original_tool_name, "error": "timeout"})
-            return _json({"status": "error", "error": "mcp_tool_timeout", "outcome": "unknown", "server": meta.server_key, "tool": meta.original_tool_name})
+            return _json({
+                "status": "error", "error": "mcp_tool_timeout", "outcome": "unknown",
+                "server": meta.server_key, "tool": meta.original_tool_name,
+                "transportTimeoutSeconds": timeout_s,
+                "detail": "OpenBear MCP transport deadline exceeded. Tool timeout arguments cannot extend this limit; remote execution may still be running. Check the outcome before retrying.",
+            })
         except Exception as exc:
             err = _short_error(exc)
             log.warning("mcp.tool.failed", server=meta.server_key, tool=meta.original_tool_name, error=err)
@@ -647,6 +654,8 @@ class MCPManager:
         result = await context.web_confirm(payload)
         if feedback is not None:
             feedback.update(result)
+        if result.get("decision") == "confirm_with_changes" and result.get("authorizationGranted") is True:
+            return "amendments_required"
         decision = "deny"
         if (result.get("status", "answered") == "answered"
                 and not bool(result.get("cancelled"))

@@ -55,8 +55,11 @@ class WebAdminConversationTreeMixin:
             CASE WHEN TRIM(COALESCE(workspace_dir,''))<>'' THEN 1 ELSE 0 END AS has_local_workspace,
             CASE WHEN TRIM(COALESCE(prompt_markdown,''))<>'' THEN 1 ELSE 0 END AS has_local_prompt
         """
+        # rec_managed marks the folder owned by the recommendation feature (read-only flag).
         cur = await self.db.conn.execute(
-            f"SELECT {columns} FROM web_conversation_folders WHERE owner_chat_id=?",
+            f"""SELECT {columns}, EXISTS(SELECT 1 FROM rec_settings rs WHERE rs.owner_chat_id=web_conversation_folders.owner_chat_id
+                   AND rs.folder_id=web_conversation_folders.folder_uuid) AS rec_managed
+                FROM web_conversation_folders WHERE owner_chat_id=?""",
             (int(owner_chat_id),),
         )
         return {str(row["folder_uuid"]): dict(row) for row in await cur.fetchall()}
@@ -397,6 +400,10 @@ class WebAdminConversationTreeMixin:
             (int(owner_chat_id),),
         )
         rows = [dict(row) for row in await cur.fetchall()]
+        # Background recommendation runs live in their own folder; they are not
+        # the user's recent conversations or activity (the folder tree keeps them).
+        recommendations = getattr(self, "recommendations", None)
+        background_folder = str(await recommendations.rec_folder(int(owner_chat_id)) or "") if recommendations else ""
         # The one-time legacy backfill above preserves the exact historical
         # definition; steady-state selection is now an indexed fifteen-row lookup.
         cur = await self.db.conn.execute(
@@ -405,10 +412,11 @@ class WebAdminConversationTreeMixin:
             FROM web_conversations
             WHERE owner_chat_id=? AND COALESCE(archived_at,0)=0
               AND last_interaction_at_ms>0
+              AND (?='' OR COALESCE(folder_uuid,'')<>?)
             ORDER BY last_interaction_at_ms DESC,conversation_uuid ASC
             LIMIT 15
             """,
-            (int(owner_chat_id),),
+            (int(owner_chat_id), background_folder, background_folder),
         )
         recent_times = {
             str(row["conversation_uuid"]): int(row["last_interaction_at_ms"])
@@ -539,7 +547,7 @@ class WebAdminConversationTreeMixin:
             }
             if conv_uuid in recent_times:
                 recent_items[conv_uuid] = {**item, "lastInteractionAtMs": recent_times[conv_uuid]}
-            if running or activity["activityUnread"]:
+            if (running or activity["activityUnread"]) and not (background_folder and folder_id == background_folder):
                 activity_items.append(item)
             if not running:
                 continue
@@ -659,6 +667,7 @@ class WebAdminConversationTreeMixin:
             "runningDescendantCount": int(running_counts.get(folder_id, 0)),
             "hasLocalWorkspace": bool(int(row.get("has_local_workspace") or 0)) if "has_local_workspace" in row else bool(str(row.get("workspace_dir") or "").strip()),
             "hasLocalPrompt": bool(int(row.get("has_local_prompt") or 0)) if "has_local_prompt" in row else bool(str(row.get("prompt_markdown") or "").strip()),
+            "managedBy": "recommendations" if int(row.get("rec_managed") or 0) else "",
         }
 
     def _tree_conversation_json(
@@ -779,16 +788,20 @@ class WebAdminConversationTreeMixin:
             owner, explicit_uuid, folders=folders, status=status
         ) if explicit_uuid else None
         if selected is None and not explicit_uuid:
+            # Never land the user in a background recommendation run by default.
+            recommendations = getattr(self, "recommendations", None)
+            background_folder = str(await recommendations.rec_folder(owner) or "") if recommendations else ""
             cur = await self.db.conn.execute(
                 """
                 SELECT wc.conversation_uuid
                 FROM web_conversations wc
                 WHERE wc.owner_chat_id=? AND COALESCE(wc.archived_at,0)=0
+                  AND (?='' OR COALESCE(wc.folder_uuid,'')<>?)
                 ORDER BY wc.last_conversation_at DESC,
                          COALESCE(wc.created_at,0) DESC, wc.id DESC
                 LIMIT 1
                 """,
-                (owner,),
+                (owner, background_folder, background_folder),
             )
             row = await cur.fetchone()
             if row is not None:
@@ -978,6 +991,7 @@ class WebAdminConversationTreeMixin:
                     "folderId": str(row.get("folder_uuid") or ""),
                     "parentId": str(row.get("parent_uuid") or ""),
                     "name": str(row.get("name") or ""),
+                    "managedBy": "recommendations" if int(row.get("rec_managed") or 0) else "",
                     "path": self._tree_folder_path_text(str(row.get("folder_uuid") or ""), folders),
                     "pinned": int(row.get("pinned_at") or 0) > 0,
                     "conversationCount": int(active_counts.get(str(row.get("folder_uuid") or ""), 0)),
@@ -1641,6 +1655,9 @@ class WebAdminConversationTreeMixin:
         body = await self._json_body(request)
         target = str(body.get("targetFolderId") or "").strip()
         row, _folder_metadata = await self._tree_validate_move_target(owner, "folder", folder_id, target)
+        recommendations = getattr(self, "recommendations", None)
+        if recommendations is not None and await recommendations.protects_folder(owner, folder_id):
+            return web.json_response({"ok": False, "error": "folder_managed", "message": "这个目录由推荐功能管理。先在推荐设置里关闭推荐，再删除它。"}, status=409)
         folders = await self._tree_context_folders(owner)
         if target == folder_id or target in self._tree_descendants(folder_id, folders):
             return web.json_response({"ok": False, "error": "folder_cycle"}, status=409)
@@ -1699,6 +1716,8 @@ class WebAdminConversationTreeMixin:
                     "DELETE FROM web_conversation_folders WHERE owner_chat_id=? AND folder_uuid=?",
                     (owner, folder_id),
                 )
+                if recommendations is not None:
+                    await recommendations.forget_folder(conn, owner, folder_id)
             result = await self._tree_apply_snapshot_updates_locked(
                 impact, update_snapshots=body.get("updateSnapshots") is True, mutate=mutate
             )

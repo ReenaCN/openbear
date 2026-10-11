@@ -19,10 +19,12 @@ from app.mcp.permissions import (
     classify_risk,
     make_public_tool_name,
 )
+from app.mcp.registry import register_mcp_tools
 from app.mcp.transports import StreamableHTTPTransport, _decode_http_rpc_response
 from app.mcp.types import MCPRawResult, MCPRawTool, MCPServerState, MCPToolMeta
 from app.services import Services
-from app.tools.base import ToolRuntimeContext
+from app.tools.base import ToolRegistry, ToolRuntimeContext
+from app.tools.confirmation import without_approval_argument
 
 
 def _cfg() -> Config:
@@ -106,6 +108,57 @@ def test_mcp_filter_deny_before_register():
     assert denied_global.filter_reason == "global_deny"
     assert denied_server.filtered is True
     assert denied_server.filter_reason == "server_deny"
+
+
+@pytest.mark.parametrize("server_timeout,expected", [(None, 75), (300, 300)])
+def test_mcp_schema_declares_transport_deadline_without_changing_remote_schema(server_timeout, expected):
+    cfg = _cfg()
+    cfg.mcp.tool_call_timeout_s = 75
+    server = cfg.mcp.servers["serena"]
+    server.tool_call_timeout_s = server_timeout
+    server.agent_access.mode = "all"
+    remote_schema = {"type": "object", "properties": {
+        "timeout_seconds": {"type": "number", "maximum": 600},
+    }}
+    meta = build_tool_meta(cfg.mcp, server, server_key="serena", used_names=set(), raw_tool=MCPRawTool(
+        name="find_symbol", description="Original description", input_schema=remote_schema,
+    ))
+    manager = MCPManager(cfg)
+    manager._tools[meta.public_name] = meta
+    manager._all_tools = [meta]
+    manager._clients["serena"] = SimpleNamespace()
+    reg = ToolRegistry()
+    register_mcp_tools(reg, manager)
+    for scope in ("main", "agent"):
+        tool = next(tool for tool in reg.schemas(scope=scope) if tool["name"] == meta.public_name)
+        assert tool["description"].startswith("Original description\n")
+        assert f"transport deadline: {expected} seconds per call" in tool["description"]
+        assert "cannot extend this limit" in tool["description"]
+        assert "does not confirm remote cancellation" in tool["description"]
+        assert without_approval_argument(tool)["parameters"] == remote_schema
+    assert meta.description == "Original description"
+    assert meta.input_schema == remote_schema
+
+
+async def test_mcp_timeout_reports_transport_limit_without_claiming_remote_cancellation():
+    cfg = _cfg()
+    cfg.mcp.servers["serena"].tool_call_timeout_s = 300
+    manager = MCPManager(cfg)
+    meta = build_tool_meta(cfg.mcp, cfg.mcp.servers["serena"], server_key="serena", used_names=set(),
+                           raw_tool=MCPRawTool(name="find_symbol"))
+
+    class TimedOutClient:
+        async def call_tool(self, name, arguments):
+            assert arguments == {"timeout_seconds": 600}
+            raise TimeoutError()
+
+    manager._tools[meta.public_name] = meta
+    manager._clients["serena"] = TimedOutClient()
+    result = json.loads(await manager.call_tool(meta.public_name, {"timeout_seconds": 600}, ToolRuntimeContext()))
+    assert result["error"] == "mcp_tool_timeout"
+    assert result["transportTimeoutSeconds"] == 300
+    assert result["outcome"] == "unknown"
+    assert "remote execution may still be running" in result["detail"]
 
 
 def test_mcp_output_redacts_and_truncates(tmp_path, monkeypatch):

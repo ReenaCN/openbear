@@ -7,7 +7,7 @@ import {parse, compileStyle} from '@vue/compiler-sfc';
 import {ref} from 'vue';
 import {selectVisibilityRow, visibilitySelectionClasses} from './messageVisibility.js';
 
-const files = ['MessageVisibilityAction.vue', 'MessageVisibilityBar.vue', 'ConsoleView.vue', 'ConsoleHeader.vue', 'TurnList.vue', 'TurnWorkDetailPanel.vue'];
+const files = ['MessageVisibilityAction.vue', 'MessageVisibilityBar.vue', 'ConsoleView.vue', 'ConsoleHeader.vue', 'TurnList.vue'];
 const descriptors = Object.fromEntries(files.map(file => [file, parse(fs.readFileSync(new URL(file, import.meta.url), 'utf8')).descriptor]));
 const styles = Object.fromEntries(files.map(file => [file, postcss.parse(descriptors[file].styles.map(s => s.content).join('\n'))]));
 function css(file, selector, width = 1440) {
@@ -58,9 +58,6 @@ test('desktop selection uses a custom round check and gutter marker without pain
     assert.equal(css(file, '.visibility-selected::after').width, '2px');
   }
   assert.match(descriptors['TurnList.vue'].template.content, /:target="entry.event" desktop-placement="gutter" :turn="turn"/);
-  assert.doesNotMatch(descriptors['TurnWorkDetailPanel.vue'].template.content, /MessageVisibilityAction|visibilitySelectionClasses|selectVisibilityRow/);
-  assert.equal(css('TurnWorkDetailPanel.vue', '.work-detail-entry').display, 'flex');
-  assert.equal(css('TurnWorkDetailPanel.vue', '.visibility-selected::after').width, undefined);
 });
 
 test('desktop batch bar is compact and removed from flex sizing; restore entry leaves the header', () => {

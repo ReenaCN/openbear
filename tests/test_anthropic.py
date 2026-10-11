@@ -190,7 +190,7 @@ async def test_anthropic_payload_uses_adaptive_effort_for_think_level():
 
     backend = AnthropicBackend(make_client(handler), "https://x/v1", "k")
     await aggregate(backend.stream([{"role": "user", "content": "hi"}], model="claude", think_level="max"))
-    assert captured["thinking"] == {"type": "adaptive"}
+    assert captured["thinking"] == {"type": "adaptive", "display": "summarized"}
     assert captured["output_config"] == {"effort": "max"}
 
 

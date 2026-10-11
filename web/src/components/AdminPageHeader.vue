@@ -6,6 +6,7 @@ const props = defineProps({
   title: { type: String, required: true },
   subtitle: { type: String, default: "" },
   description: { type: String, default: "" },
+  inlineActions: { type: Boolean, default: false },
 });
 const emit = defineEmits(["mobile-header-ready"]);
 const isPhone = useAdminPhone();
@@ -48,14 +49,14 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <header ref="root" class="admin-page-header" @keydown.esc.stop="closeMore(true)" @focusout="closeOnFocusLeave">
+  <header ref="root" class="admin-page-header" :class="{ 'has-inline-actions': props.inlineActions }" @keydown.esc.stop="closeMore(true)" @focusout="closeOnFocusLeave">
     <div class="admin-header-navigation"><slot name="mobile-navigation" /></div>
     <div class="admin-header-identity">
       <h1 class="admin-header-title">{{ props.title }}</h1>
       <p v-if="props.subtitle" class="admin-header-subtitle" :title="props.subtitle">{{ props.subtitle }}</p>
     </div>
     <div
-      v-show="!isPhone || moreOpen"
+      v-show="!isPhone || props.inlineActions || moreOpen"
       :id="actionsId"
       ref="actions"
       class="admin-header-actions"
@@ -68,6 +69,7 @@ onBeforeUnmount(() => {
     </div>
     <div class="admin-header-primary"><slot name="primary" /></div>
     <button
+      v-if="!props.inlineActions"
       ref="moreButton"
       type="button"
       class="admin-header-more"
@@ -142,6 +144,9 @@ onBeforeUnmount(() => {
   .admin-header-actions :deep(.el-button), .admin-header-actions :deep(.admin-header-link), .admin-header-actions :deep(.el-checkbox), .admin-header-actions :deep(.el-switch) { justify-content: flex-start; width: 100%; height: auto; min-height: 38px; margin: 0; padding: 0 9px; font-size: 12px; }
   .admin-header-actions :deep(.el-switch) { box-sizing: border-box; }
   .admin-header-actions :deep(.el-checkbox__label), .admin-header-actions :deep(.el-switch__label) { font-size: 12px; }
+  .has-inline-actions .admin-header-actions { position: static; flex-direction: row; align-items: center; gap: 2px; width: auto; max-height: none; overflow: visible; padding: 0; border: 0; background: transparent; box-shadow: none; }
+  .has-inline-actions .admin-header-actions :deep(.el-button) { width: auto; min-height: 44px; padding-inline: 8px; }
+  .has-inline-actions .admin-header-description { display: none; }
   .admin-header-description { display: block; margin: 0 0 4px; padding: 5px 9px 9px; border-bottom: 1px solid var(--ob-chat-line); font-size: 11px; line-height: 1.65; color: var(--ob-chat-subtle); }
 }
 </style>

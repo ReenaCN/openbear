@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import os
 import re
 import shlex
@@ -342,13 +343,15 @@ def _is_silent_success(command: str) -> bool:
     return base in _SILENT_COMMANDS
 
 
-def _progress_line(command: str, buf: SpoolingTextBuffer, started_at: float, *, pid: int | None = None) -> str:
+def _progress_line(command: str, buf: SpoolingTextBuffer, started_at: float, *, pid: int | None = None, timeout_note: str = "") -> str:
     elapsed = int(time.monotonic() - started_at)
     preview = buf.tail_preview(800)
     cmd = command.replace("\n", " ")[:80]
     head = f"💻 Bash 运行中 · {elapsed}s · {buf.total_bytes} bytes"
     if pid:
         head += f" · PID {pid}"
+    if timeout_note:
+        head += f"\n{timeout_note}"
     if preview:
         preview = preview.replace("<", "‹").replace(">", "›")
         return f"{head}\n最近输出：\n{preview}"
@@ -364,6 +367,7 @@ async def _consume_proc(
     progress_update=None,
     foreground: bool = True,
     detach_after_s: float = 0.0,
+    timeout_note: str = "",
 ) -> tuple[int, bool, str, bool]:
     assert proc.stdout is not None
     started = time.monotonic()
@@ -390,7 +394,7 @@ async def _consume_proc(
                 now = time.monotonic()
                 if foreground and progress_update and now - started >= _PROGRESS_AFTER_S and now - last_progress >= _PROGRESS_INTERVAL_S:
                     last_progress = now
-                    await progress_update(_progress_line(command, buf, started, pid=proc.pid))
+                    await progress_update(_progress_line(command, buf, started, pid=proc.pid, timeout_note=timeout_note))
                 if detach_deadline and now >= detach_deadline and proc.returncode is None:
                     if read_task and not read_task.done():
                         read_task.cancel()
@@ -411,7 +415,7 @@ async def _consume_proc(
             now = time.monotonic()
             if foreground and progress_update and now - started >= _PROGRESS_AFTER_S and now - last_progress >= _PROGRESS_INTERVAL_S:
                 last_progress = now
-                await progress_update(_progress_line(command, buf, started, pid=proc.pid))
+                await progress_update(_progress_line(command, buf, started, pid=proc.pid, timeout_note=timeout_note))
         # EOF on stdout is not process exit (a command may close its pipes).
         # Preserve the same command deadline while waiting for the actual exit.
         try:
@@ -438,7 +442,7 @@ async def _consume_proc(
     return rc, False, "", False
 
 
-def _format_bash_result(command: str, rc: int, buf: SpoolingTextBuffer, *, interrupted: bool, note: str = "") -> str:
+def _format_bash_result(command: str, rc: int, buf: SpoolingTextBuffer, *, interrupted: bool, note: str = "", timeout_note: str = "") -> str:
     is_error, semantic = _exit_interpretation(command, rc)
     preview = buf.render_preview().rstrip()
     status = "timeout" if interrupted else "failed" if is_error else "ok"
@@ -449,6 +453,8 @@ def _format_bash_result(command: str, rc: int, buf: SpoolingTextBuffer, *, inter
         f"output_bytes: {buf.total_bytes}",
         f"truncated: {str(buf.truncated).lower()}",
     ]
+    if timeout_note:
+        lines.append(timeout_note)
     if note:
         lines.append(f"note: {note}")
     elif semantic:
@@ -495,25 +501,30 @@ def make_bash_tool(default_timeout_s: float = 120.0, output_limit: int = 30000,
         # controller awaits the command's terminal result in this same tool call;
         # only Agent owns post-turn completion notifications.
         background_requested = bool(args.get("background", False) or args.get("run_in_background", False))
-        sleep = _detect_blocked_sleep(command)
-        if sleep and float(args.get("timeout", default_timeout_s) or default_timeout_s) > 5:
-            return f"error: blocked long sleep detected ({sleep}); use a real command with a bounded timeout"
         try:
             requested_timeout = float(args.get("timeout", default_timeout_s) or default_timeout_s)
-        except (TypeError, ValueError):
-            return "error: timeout must be a number of seconds"
+        except (TypeError, ValueError, OverflowError):
+            return "error: timeout must be a finite number of seconds"
+        if not math.isfinite(requested_timeout):
+            return "error: timeout must be a finite number of seconds"
+        sleep = _detect_blocked_sleep(command)
+        if sleep and requested_timeout > 5:
+            return f"error: blocked long sleep detected ({sleep}); use a real command with a bounded timeout"
         timeout = max(1.0, min(requested_timeout, max_timeout_s))
+        timeout_note = f"timeout: requested {requested_timeout:g}s; effective {timeout:g}s; maximum {max_timeout_s:g}s"
         cwd = args.get("cwd") or None
         expanded_cwd = os.path.expanduser(str(cwd)) if cwd else None
         if expanded_cwd and not os.path.isdir(expanded_cwd):
             return f"error: cwd does not exist: {cwd}"
+        ctx = current_tool_context()
+        if timeout != requested_timeout and ctx.progress_update:
+            await ctx.progress_update(f"💻 Bash 超时已调整\n{timeout_note}")
         log.info("执行Bash", 命令=command[:200], 超时=timeout, 请求超时=requested_timeout, 目录=cwd or ".", 请求后台=background_requested, 实际后台=False)
         try:
             proc = await _spawn(command, expanded_cwd)
         except Exception as e:
             return f"error: failed to start process: {e}"
 
-        ctx = current_tool_context()
         processes.register(
             proc.pid,
             command=command,
@@ -540,6 +551,7 @@ def make_bash_tool(default_timeout_s: float = 120.0, output_limit: int = 30000,
                 progress_update=progress_update,
                 foreground=True,
                 detach_after_s=detach_after_s,
+                timeout_note=timeout_note,
             )
         except asyncio.CancelledError:
             await _kill_and_wait(proc)
@@ -550,7 +562,7 @@ def make_bash_tool(default_timeout_s: float = 120.0, output_limit: int = 30000,
                 buf.close()
         if buf.truncated:
             log.info("Bash输出已落盘并截断回灌", 命令=command[:120], 字节=buf.total_bytes, 路径=buf.output_path)
-        return _format_bash_result(command, rc, buf, interrupted=interrupted, note=note)
+        return _format_bash_result(command, rc, buf, interrupted=interrupted, note=note, timeout_note=timeout_note)
 
     return _bash
 
@@ -813,6 +825,7 @@ def register_bash_tool(reg: ToolRegistry, *, default_timeout_s: float = 120.0,
                        output_limit: int = 30000, max_timeout_s: float = 600.0,
                        spool_max_bytes: int = _DEFAULT_SPOOL_MAX_BYTES,
                        auto_background_after_s: float = 15.0) -> None:
+    effective_default = max(1.0, min(default_timeout_s, max_timeout_s))
     reg.add(
         "Bash",
         "Run a shell command and wait for its terminal result. Commands are killed on timeout and large output is spooled to disk. background/run_in_background are accepted only as compatibility flags and do not detach execution; Bash never emits a later completion notification.",
@@ -820,7 +833,13 @@ def register_bash_tool(reg: ToolRegistry, *, default_timeout_s: float = 120.0,
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "要执行的 shell 命令"},
-                "timeout": {"type": "number", "description": "超时秒数，默认 120"},
+                "timeout": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": max_timeout_s,
+                    "default": effective_default,
+                    "description": f"超时秒数，默认 {effective_default:g}，最大 {max_timeout_s:g}；超出范围会被限制到 1–{max_timeout_s:g} 秒，不能通过此参数延长系统上限。",
+                },
                 "cwd": {"type": "string", "description": "工作目录，默认进程当前目录"},
                 "description": {"type": "string", "description": "一句话说明这个命令做什么，便于进度展示"},
                 "background": {"type": "boolean", "description": "兼容参数；即使为 true 也会等待命令结束"},

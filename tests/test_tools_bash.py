@@ -5,7 +5,9 @@ import json
 import os
 from pathlib import Path
 
-from app.tools import processes
+import pytest
+
+from app.tools import bash, processes
 from app.tools.base import ToolRegistry, ToolRuntimeContext
 from app.tools.bash import register_bash_tool
 
@@ -88,6 +90,82 @@ async def test_bash_timeout():
     out = await reg.dispatch("Bash", json.dumps({"command": "sleep 5"}))
     assert "timeout" in out
     assert processes.count() == 0
+
+
+@pytest.mark.parametrize("default,maximum,effective_default", [(17, 31, 17), (90, 31, 31)])
+def test_bash_timeout_schema_uses_config(default, maximum, effective_default):
+    reg = ToolRegistry()
+    register_bash_tool(reg, default_timeout_s=default, max_timeout_s=maximum)
+    tool = next(tool for tool in reg.schemas() if tool["name"] == "Bash")
+    timeout = tool["parameters"]["properties"]["timeout"]
+    assert timeout["minimum"] == 1
+    assert timeout["maximum"] == maximum
+    assert timeout["default"] == effective_default
+    assert f"默认 {effective_default}" in timeout["description"]
+    assert f"最大 {maximum}" in timeout["description"]
+
+
+@pytest.mark.parametrize("args,requested,effective", [({}, 17, 17), ({"timeout": 24}, 24, 24), ({"timeout": 7200}, 7200, 31), ({"timeout": -1}, -1, 1)])
+async def test_bash_reports_effective_timeout(args, requested, effective):
+    reg = ToolRegistry()
+    register_bash_tool(reg, default_timeout_s=17, max_timeout_s=31)
+    out = await reg.dispatch("Bash", json.dumps({"command": "printf done", **args}))
+    assert "status: ok" in out
+    assert f"timeout: requested {requested}s; effective {effective}s; maximum 31s" in out
+
+
+async def test_bash_requested_timeout_can_exceed_default():
+    reg = ToolRegistry()
+    register_bash_tool(reg, default_timeout_s=1, max_timeout_s=3)
+    out = await reg.dispatch("Bash", json.dumps({
+        "command": "python3 -c 'import time; time.sleep(1.1); print(\"finished\")'",
+        "timeout": 2,
+    }))
+    assert "status: ok" in out
+    assert "finished" in out
+    assert "timeout: requested 2s; effective 2s; maximum 3s" in out
+
+
+async def test_bash_clamps_timeout_before_start_and_reports_termination(monkeypatch):
+    events = []
+    spawn = bash._spawn
+
+    async def tracked_spawn(command, cwd):
+        events.append("spawn")
+        return await spawn(command, cwd)
+
+    async def progress(text):
+        events.append(text)
+
+    monkeypatch.setattr(bash, "_spawn", tracked_spawn)
+    monkeypatch.setattr(bash, "_PROGRESS_AFTER_S", 0.01)
+    reg = ToolRegistry()
+    register_bash_tool(reg, default_timeout_s=1, max_timeout_s=1)
+    out = await reg.dispatch("Bash", json.dumps({
+        "command": "python3 -c 'import time; print(\"started\", flush=True); time.sleep(5); print(\"finished\")'",
+        "timeout": 7200,
+    }), context=ToolRuntimeContext(progress_update=progress))
+    timeout_note = "timeout: requested 7200s; effective 1s; maximum 1s"
+    assert "超时已调整" in events[0] and timeout_note in events[0]
+    assert events[1] == "spawn"
+    assert any("运行中" in event and timeout_note in event for event in events[2:])
+    assert "status: timeout" in out
+    assert timeout_note in out
+    assert "timeout after 1.0s; process terminated" in out
+    assert "started" in out and "finished" not in out
+    assert processes.count() == 0
+
+
+@pytest.mark.parametrize("timeout", ["invalid", "NaN", "Infinity", "-Infinity"])
+async def test_bash_rejects_nonfinite_timeout_before_spawn(monkeypatch, timeout):
+    async def unexpected_spawn(*args):
+        pytest.fail("invalid timeout must not start a process")
+
+    monkeypatch.setattr(bash, "_spawn", unexpected_spawn)
+    reg = ToolRegistry()
+    register_bash_tool(reg)
+    out = await reg.dispatch("Bash", json.dumps({"command": "sleep 5", "timeout": timeout}))
+    assert out == "error: timeout must be a finite number of seconds"
 
 
 async def test_bash_blocks_long_sleep_when_default_long():

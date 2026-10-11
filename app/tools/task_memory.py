@@ -333,20 +333,7 @@ def register_task_memory_tool(registry: ToolRegistry, dao: TaskMemoryDAO) -> Non
     handler = TaskMemoryTool(dao)
     registry.add(
         "TaskMemory",
-        (
-            "Reference notes and continuing execution preferences for the owning conversation or independent Agent instance, "
-            "preserved across context-window rotation. Main controllers own current-conversation memory; "
-            "child Agents own their independent instance memory across successive task rounds, or task-local memory "
-            "for legacy tasks. Identity is runtime-derived, never supplied by the model. Agents may also read "
-            "explicitly shared conversation memory, but cannot modify it or access another instance's private memory. "
-            "list/search return body-free locators. Auto-injected snapshots include complete nonempty bodies of at most "
-            "500 Unicode characters; use those directly without another get. Longer bodies require get when needed. "
-            "Snapshots share a 20-item/1500-estimated-token budget and report omissions. Shared preferences are Agent "
-            "inputs even without this tool; private auto-injection requires this round's tool grant. "
-            "Do not store task logs, progress, Plan copies, implementation/test trails, completion reports or deployment receipts. "
-            "Update changed preferences in place, keeping only applicable content; consult History/AgentHistory for original "
-            "exchanges and execution records. Delete withdrawn or unneeded notes using the existing CAS revision."
-        ),
+        "Conversation-scoped reference material and continuing preferences (an Agent's own notes for that instance), kept across window changes. Not for progress, logs, Plan copies, test results, or completion/deployment reports. Short bodies (<=500 chars) are auto-injected: use them directly. list/search return locators only; get longer bodies when needed. Update a changed preference in place; delete obsolete notes with their revision. Agents can read shared conversation notes but not modify them.",
         {
             "type": "object",
             "properties": {
@@ -358,9 +345,9 @@ def register_task_memory_tool(registry: ToolRegistry, dao: TaskMemoryDAO) -> Non
                 "query": {"type": "string", "description": "Search text for action=search."},
                 "name": {"type": "string", "maxLength": 80},
                 "description": {"type": "string", "maxLength": 200, "description": "Brief description for locating this reference or preference."},
-                "body": {"type": "string", "description": "Reference or continuing preference, up to 16 KiB UTF-8. Nonempty bodies <=500 Unicode characters are auto-injected in full when selected; longer bodies are never partially injected."},
-                "autoReinjectCatalog": {"type": "boolean", "description": "Include in the bounded automatic snapshot (default true): full short body, otherwise name/description/ID only. Over-budget entries are explicitly omitted."},
-                "visibleToAgents": {"type": "boolean", "description": "Conversation notes only: share as read-only Agent input, independent of TaskMemory tool grants. Automatic snapshots still require autoReinjectCatalog."},
+                "body": {"type": "string", "description": "Material or preference, up to 16 KiB. Bodies <=500 chars are auto-injected in full."},
+                "autoReinjectCatalog": {"type": "boolean", "description": "Include in the automatic snapshot (default true)."},
+                "visibleToAgents": {"type": "boolean", "description": "Conversation notes only: share read-only with Agents."},
                 "revision": {"type": "integer", "minimum": 1, "description": "Required CAS revision for update/delete/restore."},
                 "idempotencyKey": {"type": "string", "maxLength": 160},
                 "includeShared": {"type": "boolean", "description": "For child Agent list/search, include visible conversation memories."},

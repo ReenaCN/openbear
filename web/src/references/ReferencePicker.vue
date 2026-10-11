@@ -13,7 +13,7 @@ const list=ref(null),searchInput=ref(null),searchOpen=ref(false),localQuery=ref(
 const child=ref(null),childQuery=ref(''),checked=ref(new Set()),selectionError=ref('');
 const historyConversation=ref(''),historyRows=ref([]),historyItems=ref([]),historyMore=ref(false),historyOffset=ref(0),historyBusy=ref(false),historyError=ref('');
 let historyGeneration=0,dragging=false,parentSelected=0,parentSearchOpen=false;
-const tabs=[['','全部'],['mem','记忆'],['doc','文档'],['secret','凭证'],['chat','会话'],['history','历史']];
+const tabs=[['','全部'],['mem','记忆'],['doc','文档'],['secret','凭证'],['chat','会话'],['rec','推荐'],['history','历史']];
 const queryText=computed({get:()=>child.value?childQuery.value:localQuery.value,set:value=>{if(child.value)childQuery.value=value;else localQuery.value=value;selected.value=0;}});
 const activeKind=computed(()=>props.kind||filter.value);
 const historyMode=computed(()=>Boolean(child.value)||activeKind.value==='history');

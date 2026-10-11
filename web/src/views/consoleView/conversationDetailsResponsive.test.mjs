@@ -4,9 +4,9 @@ import fs from 'node:fs';
 import {register} from 'node:module';
 import postcss from 'postcss';
 import {parse, compileScript, compileStyle, compileTemplate} from '@vue/compiler-sfc';
-import {createRenderer, h, nextTick} from 'vue';
+import {createRenderer, h, nextTick, reactive} from 'vue';
 
-const files = ['AgentEventCard.vue', 'AgentActivityList.vue', 'AgentProcessActivity.vue', 'AgentPlanWorkspace.vue', 'ToolArgumentsView.vue', 'ConsoleToolEvent.vue', 'TurnWorkDetailPanel.vue', 'TurnEvent.vue', 'TurnList.vue'];
+const files = ['AgentEventCard.vue', 'AgentActivityList.vue', 'AgentProcessActivity.vue', 'AgentPlanWorkspace.vue', 'ToolArgumentsView.vue', 'ConsoleToolEvent.vue', 'TurnEvent.vue', 'TurnList.vue'];
 const sources = Object.fromEntries(files.map(f => [f, fs.readFileSync(new URL(f, import.meta.url), 'utf8')]));
 const descriptors = Object.fromEntries(files.map(f => [f, parse(sources[f], {filename: f}).descriptor]));
 const styles = Object.fromEntries(files.map(f => [f, postcss.parse(descriptors[f].styles.filter(s => s.scoped).map(s => s.content).join('\n'))]));
@@ -100,7 +100,7 @@ test('all affected SFC scripts/templates and scoped CSS compile, including conta
   }
 });
 
-test('full long tool arguments/results survive both conversation TurnEvent and work detail paths', async t => {
+test('full long tool arguments/results survive the conversation TurnEvent path', async t => {
   const args = JSON.stringify({command: long('ARGS'), description: long('DESCRIPTION')});
   const event = toolEvent(args, long('RESULT'));
   const root = mount(t, 'TurnEvent.vue', {...detailProps, event});
@@ -109,24 +109,17 @@ test('full long tool arguments/results survive both conversation TurnEvent and w
   assert.equal(codes[0].props.innerHTML, escapeHtmlText(JSON.stringify(JSON.parse(args), null, 2)));
   assert.equal(codes[1].props.innerHTML, escapeHtmlText(long('RESULT')));
   assert.equal(walk(find(root, 'tool-detail')).filter(n => hasClass(n, 'tool-payload-code')).length, 2);
-  const work = mount(t, 'TurnWorkDetailPanel.vue', {...detailProps, open: true, turnIndex: 0, turn: {id: 'turn', events: [event]}});
-  assert.ok(text(work).includes('ARGS-END')); assert.ok(text(work).includes('RESULT-END'));
-  assert.equal(walk(find(work, 'tool-detail')).filter(n => hasClass(n, 'tool-payload-code')).length, 2);
-  assert.ok(find(work, 'work-detail-close'));
-  assert.equal(find(work, 'work-detail-body').props.tabindex, '0');
   assert.match(sources['TurnList.vue'], /<TurnEvent[\s\S]*?:event="entry\.event"/);
 });
 
-test('native disclosure, result selection, copying and close relay use the actual Vue handlers', async t => {
-  let toggle, selected, closed = 0;
+test('native disclosure, result selection and copying use the actual Vue handlers', async t => {
+  let toggle, selected;
   const event = toolEvent('{"command":"alpha"}', 'alpha-result');
   event.calls.push({id: 'call-2', name: 'Read', arguments: '{"path":"beta"}'});
   const root = mount(t, 'ConsoleToolEvent.vue', {event, open: true, activeIndex: 0, onToggle: e => {toggle = e;}, onSelectTab: n => {selected = n;}});
   const e = {target: {open: false}};
   find(root, 'tool-event').props.onToggle(e); assert.equal(toggle, e);
   find(root, 'tool-call-selector').children.filter(n => n.type === 'button')[1].props.onClick(); assert.equal(selected, 1);
-  const work = mount(t, 'TurnWorkDetailPanel.vue', {...detailProps, open: true, turn: {events: []}, onClose: () => {closed++;}});
-  find(work, 'work-detail-close').props.onClick(); assert.equal(closed, 1);
   let copied = '';
   const oldNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator'), oldWindow = globalThis.window, oldSecure = globalThis.isSecureContext;
   Object.defineProperty(globalThis, 'navigator', {configurable: true, value: {clipboard: {writeText: async v => {copied = v;}}}});
@@ -169,7 +162,7 @@ test('Agent result tab renders every supplied character beyond the old 24000 cap
 test('compaction uses full supplied summary, never manufactures absent output', async t => {
   const args = JSON.stringify({name: 'ContextCompaction', strategy: 'model_summary', scope: 'root', compactedOutput: long('COMPACTION')});
   const event = toolEvent(args, '', 'ContextCompaction');
-  const root = mount(t, 'TurnWorkDetailPanel.vue', {...detailProps, open: true, turn: {events: [event]}});
+  const root = mount(t, 'TurnEvent.vue', {...detailProps, event});
   assert.ok(text(root).includes('COMPACTION-END'));
   const detail = find(root, 'tool-detail');
   assert.equal(walk(detail).filter(n => hasClass(n, 'tool-payload-code')).length, 1, 'compaction output uses the same detail/code frame');
@@ -225,7 +218,7 @@ test('launch fallback keeps full >5000-character task while the helper default s
   assert.ok(agentRowArgumentsDisplay(event, row, 0, {full: true}).includes(prompt));
 });
 
-test('opening both paths shares the existing lazy detail cache and exposes the full loaded tail', async t => {
+test('opening the tool card uses the lazy detail cache once and exposes the full loaded tail', async t => {
   const cache = createToolDetailCache();
   const previous = Api.conversationOperationDetail;
   let requests = 0;
@@ -236,12 +229,105 @@ test('opening both paths shares the existing lazy detail cache and exposes the f
   try {
     const event = {...toolEvent('{"command":"preview"}', 'result-preview'), operation: {opId: 'fixture-operation', revision: 3, detailAvailable: true}};
     const conversation = mount(t, 'TurnEvent.vue', {...detailProps, conversationUuid: 'fixture-conversation', event}, cache);
-    const work = mount(t, 'TurnWorkDetailPanel.vue', {...detailProps, conversationUuid: 'fixture-conversation', open: true, turn: {events: [event]}}, cache);
     await new Promise(resolve => setImmediate(resolve));
     await nextTick();
     assert.equal(requests, 1);
-    for (const root of [conversation, work]) {assert.ok(text(root).includes('LOADED-ARGS-END')); assert.ok(text(root).includes('LOADED-RESULT-END'));}
+    for (const root of [conversation]) {assert.ok(text(root).includes('LOADED-ARGS-END')); assert.ok(text(root).includes('LOADED-RESULT-END'));}
   } finally {Api.conversationOperationDetail = previous;}
+});
+
+test('tool detail refresh stays silent and preserves full bodies, reading nodes and live status', async t => {
+  const requests = [];
+  t.mock.method(Api, 'conversationOperationDetail', (conversation, operation) => new Promise((resolve, reject) => requests.push({conversation, operation, resolve, reject})));
+  const settle = async () => {await new Promise(resolve => setImmediate(resolve)); await nextTick();};
+  const summary = (revision, status = 'running') => ({
+    ...toolEvent('{"command":"preview"}', ''), result: null,
+    operation: {opId: 'refresh-tool', revision, detailAvailable: true, detailLoaded: false, status,
+      payload: {name: 'Bash', arguments: '{"command":"preview"}', status}},
+  });
+  const full = (revision, status = 'running', result) => ({ok: true, operation: {
+    opId: 'refresh-tool', revision, status,
+    payload: {name: 'Bash', arguments: '{"command":"FULL-ARGUMENT-TAIL"}', status, ...(result === undefined ? {} : {resultText: result})},
+  }});
+  const props = reactive({event: summary(1), open: true, conversationUuid: 'refresh-conversation'});
+  const root = mount(t, 'ConsoleToolEvent.vue', props, createToolDetailCache());
+  await settle();
+  assert.equal(requests.length, 1);
+  assert.doesNotMatch(text(root), /正在读取完整工具详情/);
+  assert.equal(find(root, 'tool-detail-notice'), undefined);
+  requests[0].resolve(full(1)); await settle();
+  const argumentsNode = find(root, 'tool-payload-code');
+  const waitingNode = find(root, 'tool-payload-empty');
+  argumentsNode.scrollTop = 37;
+  props.event = summary(1); await settle();
+  assert.equal(requests.length, 1, 'same revision does not refetch');
+  for (const revision of [2, 3]) {
+    props.event = summary(revision); await settle();
+    assert.equal(requests.length, revision);
+    assert.ok(text(root).includes('FULL-ARGUMENT-TAIL'), 'full arguments stay visible while refresh is pending');
+    assert.equal(find(root, 'tool-detail-notice'), undefined);
+    assert.doesNotMatch(text(root), /正在读取完整工具详情/);
+    assert.equal(find(root, 'tool-payload-code'), argumentsNode);
+    assert.equal(argumentsNode.scrollTop, 37);
+    assert.equal(find(root, 'tool-payload-empty'), waitingNode);
+    assert.equal(text(waitingNode), '等待工具结果…');
+    requests.at(-1).resolve(full(revision)); await settle();
+  }
+  props.event = summary(4, 'failed'); await settle();
+  assert.ok(hasClass(find(root, 'tool-event'), 'tool-error'), 'old running detail must not overwrite current failed status');
+  assert.ok(text(root).includes('FULL-ARGUMENT-TAIL'));
+  requests.at(-1).resolve(full(4, 'failed', 'FULL-RESULT-TAIL')); await settle();
+  const resultNode = walk(root).filter(n => hasClass(n, 'tool-payload-code'))[1];
+  resultNode.scrollTop = 61;
+  props.event = summary(5, 'failed'); await settle();
+  assert.ok(text(root).includes('FULL-RESULT-TAIL'), 'full result does not revert to preview during refresh');
+  assert.equal(walk(root).filter(n => hasClass(n, 'tool-payload-code'))[1], resultNode);
+  assert.equal(resultNode.scrollTop, 61);
+  requests.at(-1).reject(new Error('refresh failed')); await settle();
+  assert.ok(text(root).includes('FULL-RESULT-TAIL'), 'failed refresh preserves existing content');
+  assert.match(text(root), /工具详情读取失败：refresh failed/);
+  props.event = summary(6, 'failed'); await settle();
+  requests.at(-1).resolve(full(6, 'failed', 'UPDATED-RESULT-TAIL')); await settle();
+  assert.ok(text(root).includes('UPDATED-RESULT-TAIL'));
+  assert.ok(!text(root).includes('FULL-RESULT-TAIL'));
+  assert.equal(find(root, 'tool-detail-notice'), undefined);
+  assert.equal(walk(root).filter(n => hasClass(n, 'tool-payload-code'))[1], resultNode);
+  assert.equal(resultNode.scrollTop, 61);
+  // Full result frames are authoritative even when their alias differs from the
+  // retained detail's resultText; don't wait for the follow-up detail request.
+  props.event = summary(7, 'completed');
+  props.event.operation.payload.result = 'LIVE-FULL-RESULT'; await settle();
+  assert.ok(text(root).includes('LIVE-FULL-RESULT'));
+  assert.ok(!text(root).includes('UPDATED-RESULT-TAIL'));
+  requests.at(-1).resolve(full(7, 'completed', 'LIVE-FULL-RESULT')); await settle();
+});
+
+test('retained tool details clear on identity changes and ignore responses from the old conversation', async t => {
+  const requests = [];
+  t.mock.method(Api, 'conversationOperationDetail', (conversation, operation) => new Promise(resolve => requests.push({conversation, operation, resolve})));
+  const settle = async () => {await new Promise(resolve => setImmediate(resolve)); await nextTick();};
+  const summary = (revision, opId = 'shared-id') => ({...toolEvent('{"command":"preview"}', ''), result: null,
+    operation: {opId, revision, detailAvailable: true, status: 'running'}});
+  const full = (revision, body, opId = 'shared-id') => ({ok: true, operation: {opId, revision,
+    payload: {name: 'Bash', arguments: JSON.stringify({command: body})}}});
+  const props = reactive({event: summary(1), open: true, conversationUuid: 'conversation-a'});
+  const root = mount(t, 'ConsoleToolEvent.vue', props, createToolDetailCache());
+  await settle(); requests[0].resolve(full(1, 'CONVERSATION-A-BODY')); await settle();
+  props.event = summary(2); await settle();
+  assert.ok(text(root).includes('CONVERSATION-A-BODY'));
+  props.conversationUuid = 'conversation-b'; await settle();
+  assert.ok(!text(root).includes('CONVERSATION-A-BODY'));
+  requests[1].resolve(full(2, 'STALE-CONVERSATION-A')); await settle();
+  assert.ok(!text(root).includes('STALE-CONVERSATION-A'));
+  assert.equal(requests[2].conversation, 'conversation-b');
+  requests[2].resolve(full(2, 'CONVERSATION-B-BODY')); await settle();
+  assert.ok(text(root).includes('CONVERSATION-B-BODY'));
+  props.event = summary(1, 'another-tool'); await settle();
+  assert.ok(!text(root).includes('CONVERSATION-B-BODY'));
+  assert.equal(requests[3].operation, 'another-tool');
+  requests[3].resolve(full(1, 'ANOTHER-TOOL-BODY', 'another-tool')); await settle();
+  assert.ok(text(root).includes('ANOTHER-TOOL-BODY'));
+  assert.doesNotMatch(text(root), /正在读取完整工具详情/);
 });
 
 test('Plan method expand and step selection keep complete existing text and final outputs', async t => {
@@ -355,36 +441,6 @@ test('framed grid payloads shrink to available width; four borders remain and co
     assert.equal(css('ConsoleToolEvent.vue', '.context-detail-section .tool-payload-code code.hljs', env)['min-width'], '0');
     assert.equal(css('ConsoleToolEvent.vue', '.context-detail-section .tool-payload-code code.hljs', env)['white-space'], 'pre-wrap');
   }
-});
-
-test('work surface follows its parent; phone covers composer, narrow desktop reserves it, close stays outside body scroll', () => {
-  for (const env of [phone, {...phone, width: 320, mobileHeight: 320}, {...desktop, width: 820, cardWidth: 300}, desktop]) {
-    const pane = css('TurnWorkDetailPanel.vue', '.work-detail', env), opened = css('TurnWorkDetailPanel.vue', '.work-detail.open', env), surface = css('TurnWorkDetailPanel.vue', '.work-detail-surface', env);
-    const workspaceWidth = env.width > 760 ? env.width - 300 : env.width;
-    const paneWidth = px(opened.width, env, workspaceWidth), surfaceWidth = px(surface.width, env, paneWidth - 1);
-    assert.ok(surfaceWidth + 1 <= paneWidth + .01, 'surface including left border stays inside parent, not 88vw');
-    assert.equal(pane['box-sizing'], 'border-box'); assert.equal(surface['min-height'], '0');
-    if (env.width <= 760) {
-      assert.equal(pane.height, 'auto'); assert.equal(pane.inset, '0'); assert.equal(opened.width, '100%');
-      assert.equal(pane['z-index'], '50');
-      assert.equal(css('TurnWorkDetailPanel.vue', '.work-detail-entry', env).display, 'block');
-      assert.equal(css('TurnWorkDetailPanel.vue', '.work-detail-entry > .work-event', env).width, '100%', 'work card retains its original full-width reading layout');
-    } else if (env.width <= 1280) {assert.equal(pane.height, 'auto'); assert.equal(pane.inset, '0 0 var(--console-composer-height, 135px) auto');}
-    const body = css('TurnWorkDetailPanel.vue', '.work-detail-body', env); assert.equal(body.overflow, 'auto'); assert.equal(body['min-height'], '0');
-    assert.equal(css('TurnWorkDetailPanel.vue', '.work-detail-header', env).flex, '0 0 auto');
-  }
-  const template = descriptors['TurnWorkDetailPanel.vue'].template.content;
-  assert.ok(template.indexOf('work-detail-close') < template.indexOf('work-detail-body'));
-  assert.ok(template.indexOf('work-detail-turn-preview') > template.indexOf('work-detail-body'), 'phone context preview scrolls; the 44px close row does not');
-  assert.equal(css('TurnWorkDetailPanel.vue', '.work-detail-turn-preview', phone).display, 'block');
-  assert.equal(css('TurnWorkDetailPanel.vue', '.work-detail-turn-preview', desktop).display, 'none');
-  assert.equal(css('TurnWorkDetailPanel.vue', '.work-detail-close', phone).height, '44px');
-  assert.match(fs.readFileSync(new URL('./ConsoleView.vue', import.meta.url), 'utf8'), /'--console-composer-height': `\$\{composerHeight\}px`/);
-  const composer = parse(fs.readFileSync(new URL('./ConsoleComposer.vue', import.meta.url), 'utf8')).descriptor;
-  const composerCss = postcss.parse(composer.styles.map(s => s.content).join('\n'));
-  let composerLayer = 0;
-  composerCss.walkDecls('z-index', d => { if (Number.isFinite(Number(d.value))) composerLayer = Math.max(composerLayer, Number(d.value)); });
-  assert.ok(composerLayer > 0 && composerLayer < Number(css('TurnWorkDetailPanel.vue', '.work-detail', phone)['z-index']), 'phone detail is above the actual composer stacking layer');
 });
 
 test('narrow Plan cards scroll as one column, while wide desktop keeps original two columns and text expansion', () => {

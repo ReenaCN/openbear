@@ -179,6 +179,8 @@ class WebAdminServer(
         # visible yet. Values are turn UUID sets so concurrent starters cannot
         # clear each other's guard.
         self._web_starting_turns: dict[str, set[str]] = {}
+        self._web_steering_handoffs: set[asyncio.Task[Any]] = set()
+        self._web_stopping = False
         self._web_task_notification_locks: dict[int, asyncio.Lock] = {}
         self._web_task_notification_pending: dict[str, list[dict[str, Any]]] = {}
         self._web_task_notification_deferred: dict[str, list[dict[str, Any]]] = {}
@@ -212,6 +214,7 @@ class WebAdminServer(
     async def start(self) -> None:
         if not self.config.web.enabled:
             return
+        self._web_stopping = False
         await self.ensure_secret_key()
         app = self.make_app()
         self._runner = web.AppRunner(app)
@@ -275,6 +278,9 @@ class WebAdminServer(
         log.info("Web 管理服务已启动", host=self.config.web.host, port=self.config.web.port)
 
     async def stop(self) -> None:
+        # Close admission before any await: controller done callbacks can run
+        # throughout shutdown, including after the runner registry is drained.
+        self._web_stopping = True
         if self._web_notification_recovery_task is not None:
             self._web_notification_recovery_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -297,6 +303,14 @@ class WebAdminServer(
             self._runner = None
             self._site = None
         await self.telegram_replies.stop()
+        # Handoffs are not controller runners yet. Stop them first so none can
+        # register a new controller after cancel_all_and_wait takes its snapshot.
+        handoffs = list(self._web_steering_handoffs)
+        for task in handoffs:
+            task.cancel()
+        if handoffs:
+            await asyncio.gather(*handoffs, return_exceptions=True)
+        self._web_steering_handoffs.clear()
         if self.runs is not None:
             await self.runs.cancel_all_and_wait()
         await self.interactions.stop()

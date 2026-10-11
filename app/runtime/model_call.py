@@ -42,6 +42,7 @@ class AttemptOutcome:
     response: AgentResult = field(default_factory=AgentResult)
     status: Literal["ok", "error", "cancelled"] = "ok"
     error: OpenBearLLMError | None = None
+    started_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
     usage_reported: bool = False
     prompt_usage_reported: bool = False
     connect_ms: int = 0
@@ -114,6 +115,13 @@ async def execute_attempt(
     ``on_start`` commits pre-request facts; failure prevents transport/settle.
     Its latency is excluded from the physical request timing.
     """
+    # A composite backend may select another physical provider, but must execute
+    # every request through this boundary (no synthetic outer attempt to bill).
+    composite = getattr(request.backend, "execute_physical_attempts", None)
+    if callable(composite):
+        return await composite(request, settle=settle, after_settle=after_settle,
+            on_start=on_start, on_event=on_event, logical_partial=logical_partial,
+            cancel_check=cancel_check, mode=mode, cancel_settle_timeout_s=cancel_settle_timeout_s)
     from app.runtime.budget import current_budget
     budget = current_budget()
     if budget is not None:
@@ -148,6 +156,8 @@ async def execute_attempt(
             async with session.account_attempt(value) as first:
                 if first and caller_settle is not None:
                     await _invoke(caller_settle, value)
+                if first and budget is not None and callable(getattr(budget, "account_attempt", None)):
+                    await budget.account_attempt(value)
         # Presentation may take a Web publish lock and wait for another writer.
         # It must never run inside the atomic ledger/action transaction.
         if after_settle is not None:
@@ -156,16 +166,22 @@ async def execute_attempt(
             await budget.after_call()
 
     settle = commit_attempt
-    if on_start is not None:
-        try:
+    try:
+        if on_start is not None:
             await _invoke(on_start, outcome)
-        except BaseException:
-            # Preflight persistence/control failed before invoking the provider.
-            # This is known not-sent, not an uncertain remote execution.
-            if session is not None and session.store is not None:
-                await session.store.finish_action(outcome.attempt_id, status="not_started",
-                    detail={"reason": "pre_request_callback_failed", "usageKnown": False})
-            raise
+        if budget is not None:
+            # A preflight writer/presentation wait can cross midnight. Recheck
+            # the current day and stamp immediately before entering transport.
+            await budget.before_call()
+        outcome.started_at_ms = int(time.time() * 1000)
+        if budget is not None and callable(getattr(budget, "start_attempt", None)):
+            await budget.start_attempt(outcome)
+    except BaseException:
+        # Preflight persistence/control failed before invoking the provider.
+        if session is not None and session.store is not None:
+            await session.store.finish_action(outcome.attempt_id, status="not_started",
+                detail={"reason": "pre_request_callback_failed", "usageKnown": False})
+        raise
     partial = logical_partial if logical_partial is not None else AgentResult()
     started = time.monotonic()
     reasoning_started: float | None = None

@@ -156,6 +156,45 @@ async def test_web_task_notification_test_uses_logged_in_telegram_owner(admin_en
     assert called == [123]
 
 
+async def test_progress_reminder_defaults_work_without_saved_configuration(admin_env):
+    from app.agent.progress_watch import DEFAULT_AGENT_PROMPT, DEFAULT_CONTROLLER_PROMPT, ProgressWatch
+
+    original = admin_env.cfg_path.read_bytes()
+    assert "agent" not in json.loads(original)
+    current = await admin_env.client.get("/api/settings", cookies=admin_env.cookie)
+    assert current.status == 200
+    values = (await current.json())["values"]
+    assert values["agent.progressReminder.enabled"] is True
+    assert values["agent.progressReminder.minutes"] == 15
+    assert values["agent.progressReminder.controllerPrompt"] == DEFAULT_CONTROLLER_PROMPT
+    assert values["agent.progressReminder.agentPrompt"] == DEFAULT_AGENT_PROMPT
+    assert admin_env.cfg_path.read_bytes() == original
+
+    for field, expected in (("controllerPrompt", "请用户介入"), ("agentPrompt", "报告主控")):
+        preview = await admin_env.client.post("/api/settings/prompt-preview", cookies=admin_env.cookie,
+            json={"path": "agent.progressReminder." + field, "value": ""})
+        assert preview.status == 200
+        assert expected in (await preview.json())["rendered"]
+    assert admin_env.cfg_path.read_bytes() == original
+
+    disabled = await admin_env.client.patch("/api/settings/agent.progressReminder.enabled",
+        cookies=admin_env.cookie, json={"value": False})
+    assert disabled.status == 200
+    assert json.loads(admin_env.cfg_path.read_text())["agent"] == {"progressReminder": {"enabled": False}}
+    assert not ProgressWatch.from_config(admin_env.server.config.agent).enabled
+    assert not ProgressWatch.from_config(admin_env.server.config.agent, agent=True).enabled
+
+    enabled = await admin_env.client.patch("/api/settings/agent.progressReminder.enabled",
+        cookies=admin_env.cookie, json={"value": True})
+    assert enabled.status == 200
+    for agent, expected in ((False, "请用户介入"), (True, "报告主控")):
+        now = [1000.0]
+        watch = ProgressWatch.from_config(admin_env.server.config.agent, agent=agent, clock=lambda: now[0])
+        assert watch.enabled and watch.threshold_s == 900
+        now[0] += 900
+        assert expected in watch.take_notice()
+
+
 async def test_web_settings_provider_count_is_config_only(admin_env, monkeypatch):
     async def ledger_aggregation_forbidden(*args, **kwargs):
         raise AssertionError("config-only provider count must not aggregate model_calls")
@@ -264,7 +303,7 @@ async def test_web_settings_specs_get_and_patch_masks_sensitive_values(admin_env
     ]
     agent_sections = next(domain for domain in specs_data["domains"] if domain["key"] == "agent")["sections"]
     assert [section["key"] for section in agent_sections] == [
-        "agent", "user_message_template", "retry", "timeouts", "compaction", "rath", "rath_prompts",
+        "agent", "progress_reminder", "user_message_template", "retry", "timeouts", "compaction", "rath", "rath_prompts",
     ]
     assert "agent.retryMaxDelayS" in next(section for section in agent_sections if section["key"] == "retry")["paths"]
     assert specs_data["specs"]["memory.accessKey"]["sensitive"] is True

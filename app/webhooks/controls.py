@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import secrets
 
+from app.tools.confirmation import argument_digest, constraints_within
 from app.webhooks.contracts import Scope, WebhookError, digest, dumps, iso, parse_config
 from app.webhooks.repository import many, one
 from app.webhooks.waits import cancel_endpoint_waits
@@ -17,8 +18,25 @@ async def impact(s,conn,eid):
     return dict(pendingEvents=count['n'],activeWaits=len(waits),runningStages=jobs+assignments,waitIds=[w['wait_id'] for w in waits],stopped=[],unconfirmed=[])
 
 
-async def prepare(s,owner,eid,action,request):
+async def tool_constraints(conn, eid, info, action, request):
+    """Known Webhook effects, never counts or guessed fields from an external tool."""
+    events = await many(conn, 'SELECT event_id FROM webhook_events WHERE endpoint_id=? AND (terminal_at_ms IS NULL OR review_required=1)', (eid,))
+    queued = await many(conn, "SELECT job_id FROM webhook_stage_jobs WHERE endpoint_id=? AND state IN ('pending','held')", (eid,))
+    stops = []
+    if action == 'delete' and request.get('stopRunning', False):
+        stops = ['model'] + (['scripts'] if request.get('scope', 'all') == 'all' else [])
+    return {'sets': {'events': [row['event_id'] for row in events],
+                     'queuedJobs': [row['job_id'] for row in queued],
+                     'waits': info['waitIds'],
+                     'running': [dumps(row) for row in info['runningStages']],
+                     'stops': stops}}
+
+
+async def prepare(s,owner,eid,action,request,*,tool_approval=False):
     if action not in ('delete','rotate_key'): raise WebhookError('invalid_confirmation_action')
+    if tool_approval and action == 'delete':
+        if type(request.get('stopRunning', False)) is not bool: raise WebhookError('invalid_stop_running')
+        if request.get('scope', 'all') not in ('all', 'current'): raise WebhookError('invalid_stop_scope')
     async with s.db.webhook_transaction() as conn:
         e=await s.endpoint_row(conn,eid,owner)
         if request.get('expectedControlRevision',e['control_version'])!=e['control_version']: raise WebhookError('control_conflict',status=409,currentRevision=e['control_version'])
@@ -26,8 +44,19 @@ async def prepare(s,owner,eid,action,request):
         token=secrets.token_urlsafe(32); expiry=s.clock()+300000
         s.confirmations={k:v for k,v in s.confirmations.items() if v['expiry']>s.clock()}
         if len(s.confirmations)>1000: raise WebhookError('too_many_confirmations',status=429)
-        s.confirmations[digest(token)]={'owner':owner,'endpoint':eid,'action':action,'revision':e['current_revision'],'control':e['control_version'],'params':{k:v for k,v in request.items() if k!='prepare'},'impact':info,'expiry':expiry}
-    return {'impact':info,'confirmationToken':token,'expiresAt':iso(expiry)}
+        grant={'owner':owner,'endpoint':eid,'action':action,'revision':e['current_revision'],'control':e['control_version'],'params':{k:v for k,v in request.items() if k!='prepare'},'impact':info,'expiry':expiry}
+        result={'impact':info,'confirmationToken':token,'expiresAt':iso(expiry)}
+        if tool_approval:
+            # Only deleting may narrow stops. Rotation grace and all other
+            # business parameters stay exact; no safety ordering is assumed.
+            excluded = {'requestId', 'expectedControlRevision'} | ({'stopRunning', 'scope'} if action == 'delete' else set())
+            grant['approvalConstraints'] = await tool_constraints(conn, eid, info, action, request)
+            result.update(approvalScope={'contract': 'webhook-control-v1', 'endpointId': eid, 'action': action,
+                'revision': e['current_revision'], 'controlRevision': e['control_version'],
+                'parameters': argument_digest({k: v for k, v in grant['params'].items() if k not in excluded})},
+                approvalConstraints=grant['approvalConstraints'])
+        s.confirmations[digest(token)]=grant
+    return result
 
 
 async def confirmed(s,conn,owner,eid,action,submitted):
@@ -36,7 +65,9 @@ async def confirmed(s,conn,owner,eid,action,submitted):
     if not grant or grant['owner']!=owner or grant['endpoint']!=eid or grant['action']!=action or grant['expiry']<=s.clock(): raise WebhookError('confirmation_required',status=403)
     actual=await impact(s,conn,eid)
     expected=grant['impact']
-    if e['current_revision']!=grant['revision'] or e['control_version']!=grant['control'] or actual!=expected:
+    within = (constraints_within(grant['approvalConstraints'], await tool_constraints(conn, eid, actual, action, grant['params']))
+              if 'approvalConstraints' in grant else actual == expected)
+    if e['current_revision']!=grant['revision'] or e['control_version']!=grant['control'] or not within:
         raise WebhookError('confirmation_stale',status=409,details={'impact':actual})
     return {**grant['params'],'requestId':submitted['requestId'],'expectedControlRevision':grant['control']}
 

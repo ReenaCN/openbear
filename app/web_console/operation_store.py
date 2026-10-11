@@ -1386,6 +1386,11 @@ class WebAdminOperationsMixin:
             root = str(payload.get("rootTurnUuid") or payload.get("turnUuid") or payload.get("runUuid") or "")
             if await cron_service.owns_event(conv_uuid, root):
                 return payload  # Cron notifies after its optional cleanup, not model-done.
+        rec_service = getattr(self, "recommendations", None)
+        if rec_service is not None:
+            root = str(payload.get("rootTurnUuid") or payload.get("turnUuid") or payload.get("runUuid") or "")
+            if await rec_service.owns_event(conv_uuid, root):
+                return payload  # Recommendation cycles send their own digest only.
         webhook_service = getattr(self, "webhooks", None)
         if webhook_service is not None:
             from app.webhooks.notifications import owns_event

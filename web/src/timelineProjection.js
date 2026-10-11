@@ -96,11 +96,16 @@ function mergeAnswerEvent(events, next) {
   else events.push(next);
 }
 
+/** Reasoning exists either as loaded text or as a finished, not-yet-fetched detail. */
+export function answerHasReasoning(event) {
+  return Boolean(String(event?.message?.reasoning || "").trim() || event?.message?.reasoningDeferred);
+}
+
 function finishActiveReasoning(turn, boundaryAtMs = 0) {
   if (!turn || !Array.isArray(turn.events)) return;
   for (let index = 0; index < turn.events.length; index++) {
     const item = turn.events[index];
-    if (item?.kind !== "answer" || !item.message?.reasoning) continue;
+    if (item?.kind !== "answer" || !answerHasReasoning(item)) continue;
     // Once a boundary has closed this reasoning, later boundaries cannot
     // change it. Preserve out-of-order earlier timestamps by taking the slow
     // path for them, rather than assuming creation times are monotonic.
@@ -996,6 +1001,8 @@ export function projectOperationMessages(operations = [], options = {}) {
         eventCard: payload.eventCard || null,
         cronCard: payload.cronCard || null,
         cronRunId: payload.cronRunId || '',
+        recommendationCard: payload.recommendationCard || null,
+        recommendationRunId: payload.recommendationRunId || '',
         content: String(payload.text || payload.content || ""),
         ...(payload.referenceBundleId ? {referenceBundleId: payload.referenceBundleId, references: payload.references || []} : {}),
         attachments: Array.isArray(payload.attachments) ? payload.attachments : [],
@@ -1025,7 +1032,9 @@ export function projectOperationMessages(operations = [], options = {}) {
     }
     if (opType === "reasoning") {
       const text = operationPayloadText(payload);
-      if (text) {
+      // Finished reasoning arrives without its text; the card fetches it on expand.
+      const deferred = !text && Boolean(op.detailAvailable && !op.detailLoaded);
+      if (text || deferred) {
         const active = !payload.complete && !OP_TERMINAL_STATUSES.has(String(op.status || "")) && op.lifecycle !== "terminal";
         mergeAnswerEvent(turn.events, {
           kind: "answer",
@@ -1036,7 +1045,7 @@ export function projectOperationMessages(operations = [], options = {}) {
           startedAt: opStartedAtMs(op),
           reasoningActive: active,
           operation: op,
-          message: { id: `${op.opId}:message`, eventKey: op.opId, turnUuid: turn.turnUuid, role: "assistant", content: "", reasoning: text, live: active },
+          message: { id: `${op.opId}:message`, eventKey: op.opId, turnUuid: turn.turnUuid, role: "assistant", content: "", reasoning: text, reasoningDeferred: deferred, live: active },
         });
       }
       continue;
@@ -1137,6 +1146,9 @@ export function projectOperationMessages(operations = [], options = {}) {
       if (opType === "status") continue;
       const taskUuid = String(payload.taskUuid || payload.task_uuid || "").trim();
       const taskNotice = opType === "notice" && taskUuid ? formatTaskNotice(payload, taskInfoByUuid.get(taskUuid)) : null;
+      // Reminders persisted before runtimeNotice was added only carry this fixed text.
+      const runtimeNotice = opType === "notice" && !taskUuid && (payload.runtimeNotice === true
+        || /^已 \d+ 分钟以上没有推进，已提醒模型重新审视状态（第 \d+ 次）$/.test(String(payload.text || "")));
       turn.events.push({
         kind: "live_status",
         id: op.opId,
@@ -1146,6 +1158,7 @@ export function projectOperationMessages(operations = [], options = {}) {
         preview: taskNotice?.preview || payload.preview || "",
         active: false,
         notification: Boolean(taskNotice?.notification || payload.notification),
+        runtimeNotice,
         agentNotice: Boolean(taskNotice?.agentNotice),
         taskUuid: taskNotice?.taskUuid || taskUuid,
       });

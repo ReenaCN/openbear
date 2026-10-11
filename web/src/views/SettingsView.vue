@@ -12,6 +12,12 @@ const webhookSettingFailures = reactive({});
 const MdEditor = defineAsyncComponent(() => import("../components/AdaptiveMdEditor.vue"));
 const PromptTemplateEditor = defineAsyncComponent(() => import("../components/PromptTemplateEditor.vue"));
 const userMessageTemplateCompletionRoots = ['time', 'message', 'conversation', 'runtimeInfo.model', 'runtimeInfo.host', 'runtimeInfo.os', 'folderWorkspaceDir'];
+const progressReminderCompletionRoots = ['loop'];
+function templateCompletionRoots(path) {
+  if (path === 'userMessageTemplate.template') return userMessageTemplateCompletionRoots;
+  if (path === 'agent.progressReminder.controllerPrompt' || path === 'agent.progressReminder.agentPrompt') return progressReminderCompletionRoots;
+  return null;
+}
 
 function builtinPrompt(spec) {
   return spec?.defaultValue || "";
@@ -503,7 +509,7 @@ onMounted(load);
                     </div>
                   </div>
                   <div v-if="isPromptEditing(spec)" class="settings-prompt-editor mt-4">
-                    <PromptTemplateEditor v-if="spec.editor === 'template'" mobile-flow v-model="draft[spec.path]" :completion-roots="spec.path === 'userMessageTemplate.template' ? userMessageTemplateCompletionRoots : null" square />
+                    <PromptTemplateEditor v-if="spec.editor === 'template'" mobile-flow v-model="draft[spec.path]" :completion-roots="templateCompletionRoots(spec.path)" square />
                     <MdEditor v-else mobile-flow v-model="draft[spec.path]" completion-mode="none" square />
                   </div>
                   <div class="settings-technical is-open">

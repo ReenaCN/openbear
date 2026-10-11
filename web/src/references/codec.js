@@ -1,8 +1,8 @@
 import MarkdownIt from 'markdown-it';
 
 export const REFERENCE_MIME = 'application/x-openbear-reference+json';
-export const REFERENCE_KINDS = ['mem', 'doc', 'secret', 'chat', 'turn', 'message'];
-export const KIND_LABELS = {mem: '记忆', doc: '文档', secret: '凭证', chat: '会话', turn: '本轮问答', message: '消息'};
+export const REFERENCE_KINDS = ['mem', 'doc', 'secret', 'chat', 'turn', 'message', 'rec'];
+export const KIND_LABELS = {mem: '记忆', doc: '文档', secret: '凭证', chat: '会话', turn: '本轮问答', message: '消息', rec: '推荐'};
 const referencePattern = /\[((?:\\.|[^\[\]\\\n])*)\]\((openbear:\/\/ref\/[^\s)]+)\)/g;
 // Keep this syntax-only preset aligned with app/references.py.
 const referenceMarkdown = new MarkdownIt('default', {html:false,linkify:false});
@@ -13,6 +13,7 @@ export function normalizeReference(input) {
   const id = String(input.id || input.conversationUuid || '');
   if (!id || id.length > 160 || /[\r\n\0]/.test(id)) return null;
   if (['mem','doc','secret'].includes(input.kind) && (!/^[1-9]\d*$/.test(id) || BigInt(id) > 9223372036854775807n)) return null;
+  if (input.kind === 'rec' && !/^[0-9a-fA-F-]{8,64}$/.test(id)) return null;
   const ref = {kind: input.kind, id, label: String(input.label || input.title || input.name || id).slice(0,300), scope: input.scope === 'recent' ? 'recent' : 'full'};
   if (input.mode === 'mention') {
     ref.mode = 'mention';

@@ -4,6 +4,8 @@ from __future__ import annotations
 import inspect
 
 from app.agent.native_continuation import deserialize_messages, validate_model_context
+from app.agent.progress_watch import ProgressWatch
+from app.agents.supervision import restore_review_state, review_observation
 from app.context.configuration import conversation_strategy
 from app.context.editor import branch_settings, EditedToolRegistry
 from app.context.prompts import effective_context_prompt
@@ -55,6 +57,8 @@ class WebAdminChatRunMixin:
         webhook_assignment_id: str = "",
         webhook_resume_message_id: int = 0,
         cron_run_id: str = "",
+        recommendation_run_id: str = "",
+        backend_override: Any = None,
     ) -> bool:
         messages = MessageDAO(self.db)
         user_saved = False
@@ -105,6 +109,9 @@ class WebAdminChatRunMixin:
                 stats_identity["runUuid"] = live_run_uuid
             edited_context = await branch_settings(self.db, conversation_uuid)
             run_tools = EditedToolRegistry(self.tools, edited_context['tools']) if edited_context else self.tools
+            if recommendation_run_id:
+                from app.tools.recommendation import RecommendationRunTools
+                run_tools = RecommendationRunTools(run_tools)
             prompt_builder = self._build_system_prompt_for_chat
             cached_system = await messages.get_system_snapshot(chat_id)
             if edited_context or cached_system:
@@ -166,6 +173,10 @@ class WebAdminChatRunMixin:
             # prior durable transcript; the rich current user message is appended
             # only after that checkpoint has been safely restored.
             backend, model_id, max_tokens = self.llm_factory.backend_for(model_label)
+            if backend_override is not None:
+                # Recommendation same-protocol fallback chain; the first entry is
+                # model_label, so identity/pricing below stay those of the chain head.
+                backend = backend_override
             backend_protocol = str(getattr(backend, "protocol", "") or "").lower()
             model_meta = self.config.models.resolve(model_label)
             service_tier = ""
@@ -283,6 +294,9 @@ class WebAdminChatRunMixin:
             if cron_run_id:
                 from app.cron.executor import PROVENANCE as CRON_PROVENANCE
                 llm_text = CRON_PROVENANCE + "\nTrusted Cron run: " + cron_run_id + "\n\n" + llm_text
+            if recommendation_run_id:
+                llm_text = ("Recommendation cycle (trusted runtime provenance): an automatic run of the "
+                            "recommendation module, not a live human message.\n\n" + llm_text)
             if background_control_payload:
                 llm_text += (
                     "\n\n<background-agent-control-context>\n"
@@ -350,7 +364,7 @@ class WebAdminChatRunMixin:
                     run_root_turn_uuid=root_turn_uuid,
                     op_ids=[user_op_id] if user_op_id else None,
                     tokens=estimate_tokens(visible_user_text),
-                    binding_meta={"source": "webhook", "assignmentId": webhook_assignment_id} if webhook_assignment_id else {"source": "cron", "cronRunId": cron_run_id} if cron_run_id else None,
+                    binding_meta={"source": "webhook", "assignmentId": webhook_assignment_id} if webhook_assignment_id else {"source": "cron", "cronRunId": cron_run_id} if cron_run_id else {"source": "recommendation", "recommendationRunId": recommendation_run_id} if recommendation_run_id else None,
                 )
             else:
                 user_message_id = await messages.add(
@@ -359,19 +373,19 @@ class WebAdminChatRunMixin:
                     visible_user_text,
                     tokens=estimate_tokens(visible_user_text),
                 )
-            mark_source(user_msg, kind="webhook" if webhook_assignment_id else "cron" if cron_run_id else "notification" if task_notification else "human",
+            mark_source(user_msg, kind="webhook" if webhook_assignment_id else "cron" if cron_run_id or recommendation_run_id else "notification" if task_notification else "human",
                         assignment_id=webhook_assignment_id,
                         source_id=f"message:{user_message_id}", message_id=user_message_id,
                         turn_uuid=root_turn_uuid, run_root_turn_uuid=root_turn_uuid)
             if not task_notification and not webhook_resume_message_id:
                 await messages.bump_user_turn(chat_id)
             user_saved = True
-            if not task_notification and not webhook_assignment_id and not cron_run_id:
+            if not task_notification and not webhook_assignment_id and not cron_run_id and not recommendation_run_id:
                 user_msg['content'] = message_with_suffix(user_msg['content'], source=user_message_source,
                     message_id=user_op_id.removeprefix('msg:') or str(user_message_id),
                     attachments=[{'name': m.file_name, 'type': m.mime_type, 'kind': m.kind, 'size': m.size} for m in media or []])
             if conversation:
-                if not task_notification:
+                if not task_notification and not recommendation_run_id:
                     await self._maybe_title_web_conversation(conversation, visible_user_text)
                 await self._touch_web_conversation(
                     conversation_uuid,
@@ -393,6 +407,7 @@ class WebAdminChatRunMixin:
                 retry_jitter_ratio=self.config.agent.retry_jitter_ratio,
                 empty_response_retry_limit=self.config.agent.empty_response_retry_limit,
                 reasoning_only_retry_limit=self.config.agent.reasoning_only_retry_limit,
+                progress_watch=ProgressWatch.from_config(self.config.agent),
             )
             async def _rewrite_assistant_artifacts(content: str) -> str:
                 if not conversation_uuid or not hasattr(self, "_rewrite_web_artifact_links"):
@@ -489,8 +504,13 @@ class WebAdminChatRunMixin:
                     protocol=str(call.get("protocol") or ""), think_level="off", call_kind="context_compaction",
                 )
                 result.controller_cost_usd += committed
-                result.call_time_ms_sum += int(call.get("totalTimeMs") or 0)
-                result.output_tokens_sum += int(call.get("outputTokens") or 0)
+                # Match the main-call producer: averages/throughput describe
+                # successful physical calls, while every attempt remains billed.
+                if call.get("status") == "ok":
+                    duration_ms = max(0, int(call.get("totalTimeMs") or 0))
+                    result.call_time_ms_sum += duration_ms
+                    result.call_time_samples += int(duration_ms > 0)
+                    result.output_tokens_sum += int(call.get("outputTokens") or 0)
                 if isinstance(call.get("usage"), Usage):
                     result.usage.merge(call["usage"])
                 result.model_calls += 1
@@ -616,7 +636,14 @@ class WebAdminChatRunMixin:
                 self._web_controller_wake_events[conversation_uuid] = controller_wake
                 self._web_controller_notifications.setdefault(conversation_uuid, [])
 
-            last_agent_review: dict[str, dict[str, Any]] = {}
+            # The last durable tool result is the consumption receipt across
+            # execution runs. Never advance a persisted cursor merely on a read.
+            last_agent_review = restore_review_state(
+                await self.agent_dao.last_supervision_snapshot(
+                    chat_id=chat_id, conversation_uuid=conversation_uuid,
+                    root_turn_uuid=root_turn_uuid,
+                )
+            ) if self.agent_dao is not None and conversation_uuid else {}
 
             async def _scoped_agent_tasks(*, include_terminal: bool = True) -> list[Any]:
                 if self.agent_dao is None:
@@ -648,12 +675,10 @@ class WebAdminChatRunMixin:
                     self._merge_agent_task_stats(result, task, status=status, task_uuid=task_uuid)
                     previous = last_agent_review.get(task_uuid, {})
                     after_seq = int(previous.get("lastEventSeq") or 0)
-                    events = await self.agent_dao.events(task_uuid, after_seq=after_seq, limit=50)
-                    if not events and after_seq <= 0:
-                        events = await self.agent_dao.events(task_uuid, limit=8)
-                    last_event_seq = max([int(getattr(event, "seq", 0) or 0) for event in events] + [after_seq])
-                    previous_status = str(previous.get("status") or "")
-                    previous_current = str(previous.get("currentStatus") or "")
+                    review_events = await self.agent_dao.supervision_events(
+                        task_uuid, after_seq=after_seq, limit=50, controller_visible=True,
+                    )
+                    events = review_events["events"]
                     if status == "needs_openbear_control":
                         counts["waitingControl"] += 1
                     elif status in terminal_statuses:
@@ -754,17 +779,16 @@ class WebAdminChatRunMixin:
                             if isinstance(step, dict)
                             and step_status.get(str(step.get("id") or ""), "pending") != "completed"
                         )
+                    observation, next_state = review_observation(
+                        task, review_events, plan_runtime, previous, now_ms=int(time.time() * 1000),
+                    )
                     snapshots.append({
+                        **observation,
                         "taskUuid": task_uuid,
                         "title": getattr(task, "title", "") or "",
                         "status": status,
                         "currentStatus": getattr(task, "current_status", "") or "",
                         "updatedAt": int(getattr(task, "updated_at", 0) or 0),
-                        "hasMeaningfulProgress": bool(
-                            events
-                            or status != previous_status
-                            or str(getattr(task, "current_status", "") or "") != previous_current
-                        ),
                         "planRuntime": plan_runtime,
                         # Full terminal/control output is carried exactly once by
                         # the newly claimed notification payload below. Keeping it
@@ -788,11 +812,7 @@ class WebAdminChatRunMixin:
                             for event in events
                         ],
                     })
-                    next_review_state[task_uuid] = {
-                        "lastEventSeq": last_event_seq,
-                        "status": status,
-                        "currentStatus": str(getattr(task, "current_status", "") or ""),
-                    }
+                    next_review_state[task_uuid] = next_state
                 last_agent_review.clear()
                 last_agent_review.update(next_review_state)
                 deduped_notifications = self._dedupe_web_task_notifications(notifications)
@@ -800,9 +820,13 @@ class WebAdminChatRunMixin:
                 controller_notifications = [
                     self._controller_task_notification(item) for item in deduped_notifications
                 ]
+                review_pending = any(item["eventPage"]["hasMore"] for item in snapshots)
                 return {
                     "wakeReason": wake_reason,
                     "rootTurnUuid": root_turn_uuid,
+                    "reviewPending": review_pending,
+                    **({"message": "Recorded Agent facts remain. Call AgentWait again to read the next page immediately, even if all Agents are terminal; this does not arm a new wait."}
+                       if review_pending else {}),
                     "summary": counts,
                     "agents": snapshots,
                     "notifications": controller_notifications,
@@ -835,6 +859,11 @@ class WebAdminChatRunMixin:
                     for item in queued_notifications
                     if isinstance(item, dict)
                 )
+                review_backlog = any(item.get("hasMore") for item in last_agent_review.values())
+                if review_backlog and not queued_notifications and not steering.has_pending(chat_id):
+                    # Drain recorded facts, not another timed supervision cycle.
+                    snapshot = await _aggregate_agent_snapshot(wake_reason="event_backlog", notifications=[])
+                    return json.dumps({"ok": True, "skipped": True, **snapshot}, ensure_ascii=False, default=str)
                 if not active and not queued_notifications:
                     # No active Agent means there is no supervision cycle to show.
                     # Return the durable snapshot to the model without emitting a
@@ -844,7 +873,8 @@ class WebAdminChatRunMixin:
                         "ok": True,
                         "skipped": True,
                         "alreadyTerminal": True,
-                        "message": "All scoped Agents are already terminal. Do not call AgentWait again; integrate their results and continue the root task as needed.",
+                        **({"message": "All scoped Agents are already terminal. Do not call AgentWait again; integrate their results and continue the root task as needed."}
+                           if not snapshot["reviewPending"] else {}),
                         **snapshot,
                     }, ensure_ascii=False, default=str)
 
@@ -870,7 +900,7 @@ class WebAdminChatRunMixin:
                 await self._touch_web_conversation(conversation_uuid, current_status=status_text)
 
                 wake_reason = "task_notification"
-                if not queued_requires_wake and not steering.has_pending(chat_id):
+                if not queued_requires_wake and not review_backlog and not steering.has_pending(chat_id):
                     if mode == "review_after" and review_after_s > 0:
                         try:
                             await asyncio.wait_for(controller_wake.wait(), timeout=review_after_s)
@@ -970,11 +1000,16 @@ class WebAdminChatRunMixin:
 
             async def _model_call_hook(call: dict[str, Any]) -> None:
                 call_usage = call.get("usage") if isinstance(call.get("usage"), Usage) else Usage()
+                call_label, call_base_cost, call_fast_cost, call_fast = model_label, base_model_cost, fast_model_cost, fast_active
+                active_entry = getattr(backend_override, "active_entry", None) if backend_override is not None else None
+                if active_entry and active_entry.get("label") != model_label:
+                    # A fallback model served this step: account it at its own price.
+                    call_label, call_base_cost, call_fast_cost, call_fast = active_entry["label"], dict(active_entry.get("cost") or {}), {}, False
                 resolved_cost = resolved_usage_cost_usd(
-                    base_model_cost,
+                    call_base_cost,
                     call_usage,
-                    fast_cost=fast_model_cost,
-                    fast_requested=fast_active,
+                    fast_cost=call_fast_cost,
+                    fast_requested=call_fast,
                     actual_service_tier=call.get("serviceTier"),
                     provider_cost_usd=call.get("providerCostUsd"),
                 )
@@ -983,8 +1018,8 @@ class WebAdminChatRunMixin:
                     chat_id,
                     session_uuid=session_id,
                     call=call,
-                    model_cost=model_cost,
-                    model_label=model_label,
+                    model_cost=model_cost if call_label == model_label else call_base_cost,
+                    model_label=call_label,
                     protocol=backend_protocol,
                     think_level=think_level,
                     cost_usd_override=resolved_cost,
@@ -999,7 +1034,7 @@ class WebAdminChatRunMixin:
 
             runtime_tool_context = ToolRuntimeContext(
                 chat_id=chat_id, session_uuid=session_id, conversation_uuid=conversation_uuid,
-                source="webhook" if webhook_assignment_id else "cron" if cron_run_id else "web", turn_uuid=root_turn_uuid,
+                source="webhook" if webhook_assignment_id else "cron" if cron_run_id else "recommendation" if recommendation_run_id else "web", turn_uuid=root_turn_uuid,
                 run_root_turn_uuid=root_turn_uuid,
                 soft_stop_check=(lambda: self.control_actions.consume_soft_stop(chat_id)) if self.control_actions is not None else None,
                 task_notification=_task_notification_cb, conversation_event=_conversation_event_cb,
@@ -1007,6 +1042,7 @@ class WebAdminChatRunMixin:
                 webhook_assignment_id=webhook_assignment_id,
                 webhook_owner_id=int((conversation or {}).get("owner_chat_id") or 0),
                 webhook_automatic=bool(webhook_assignment_id),
+                recommendation_run_id=recommendation_run_id,
             )
             webhook_service = getattr(self, "webhooks", None)
             if webhook_service is not None and webhook_service.bridge is not None:
@@ -1097,7 +1133,7 @@ class WebAdminChatRunMixin:
                     )
                 else:
                     await self._touch_web_conversation(conversation_uuid, status="idle", current_status="就绪", last_error="")
-                    if turn_succeeded and conversation and not task_notification and not cron_run_id:
+                    if turn_succeeded and conversation and not task_notification and not cron_run_id and not recommendation_run_id:
                         self._start_conversation_title_task(conversation, automatic=True)
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):

@@ -120,10 +120,12 @@ test('compact total includes full input plus output once, retaining input/cache 
   assert.match(vm.runInContext('totalTokensDetail.value',ctx),/155 Tokens.*\n135\/20\/30/);
 });
 
-test('mobile properties menu keeps a 44px hit area without stretching the title row', () => {
-  const css = header.styles.map(s => s.content).join('\n');
+test('header retains full path and desktop properties while giving the mobile title its own truncation row', async () => {
+  const html = await renderHeader({title:'需要完整保留的长会话标题',conversationPath:'工程 / OpenBear / 界面优化'});
+  assert.match(html, /title="\/工程\/OpenBear\/界面优化" aria-label="所在目录 \/工程\/OpenBear\/界面优化"/);
+  assert.match(html, /header-title-row flex min-w-0 items-center gap-2/);
+  assert.match(html, /title="需要完整保留的长会话标题"/);
   assert.match(header.template.content, /el-dropdown class="header-properties-dropdown"/);
-  assert.match(css, /\.header-properties-dropdown\s*\{[^}]*height: 20px/);
-  assert.match(css, /\.header-properties-menu\s*\{[^}]*position: absolute[^}]*width: 44px[^}]*height: 44px/);
-  assert.match(css, /\.header-identity, \.header-title-stack\s*\{ overflow: visible; \}/);
+  assert.match(header.template.content, /@command="emit\('properties'\)"/);
+  assert.match(header.template.content, /<slot name="mobile-actions"\/>/);
 });

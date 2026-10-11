@@ -6,7 +6,7 @@ import {parse} from '@vue/compiler-sfc';
 import postcss from 'postcss';
 import {ref,computed,effectScope} from 'vue';
 import {createMessageVisibility,selectVisibilityRow} from './messageVisibility.js';
-const files=['MessageVisibilityAction.vue','MessageVisibilityMobileMenu.vue','MessageVisibilityBar.vue','TurnList.vue','TurnWorkDetailPanel.vue','ConsoleView.vue'];
+const files=['MessageVisibilityAction.vue','MessageVisibilityMobileMenu.vue','MessageVisibilityBar.vue','TurnList.vue','ConsoleView.vue'];
 const descriptors=Object.fromEntries(files.map(f=>[f,parse(fs.readFileSync(new URL(f,import.meta.url),'utf8')).descriptor]));
 function css(file,selector,width=390){const out={};postcss.parse(descriptors[file].styles.map(s=>s.content).join('\n')).walkRules(rule=>{
   if(!rule.selectors.includes(selector))return;
@@ -30,8 +30,6 @@ test('phone transcript uses explicit footer hide actions and only selection rese
     }
     assert.equal(css('TurnList.vue','.timed-row.visibility-target',width)['padding-left'],undefined);
     assert.equal(css('TurnList.vue','.timed-row.visibility-selectable',width)['padding-left'],'32px');
-    assert.equal(css('TurnWorkDetailPanel.vue','.work-detail-entry',width).display,'block');
-    assert.equal(css('TurnWorkDetailPanel.vue','.work-visibility-action',width).position,undefined);
   }
   assert.equal(css('MessageVisibilityAction.vue','.visibility-mobile-more',1440).display,'none');
   assert.match(css('TurnList.vue','.visibility-menu-target')['box-shadow'],/rgb\(var\(--ob-shadow-rgb\)/);
@@ -45,23 +43,27 @@ test('phone transcript uses explicit footer hide actions and only selection rese
   assert.equal(css('TurnList.vue','.message-hide-action',1440).display,'none');
   const transcriptCss=descriptors['TurnList.vue'].styles.map(s=>s.content).join('\n');
   assert.doesNotMatch(transcriptCss,/(?:user-select|touch-callout):\s*none/,'native message selection and copy must not be blocked');
-  assert.doesNotMatch(descriptors['TurnWorkDetailPanel.vue'].template.content,/v-message-long-press|mobile-long-press|MessageVisibilityAction|visibility-select/);
 });
 
-test('phone footer gives metadata a wrapping left column and keeps copy/hide together in a fixed right column',()=>{
-  for(const width of [320,390,430,760]) {
+test('phone footer uses full-width wrapping statistics with actions directly below on the left',()=>{
+  for(const width of [320,360,375,390,430,760]) {
     const row=css('TurnList.vue','.assistant-message-meta',width);
-    assert.equal(row.display,'grid');assert.equal(row['grid-template-columns'],'minmax(0, 1fr) auto');
+    assert.equal(row.display,'grid');assert.equal(row['grid-template-columns'],'minmax(0, 1fr)');
+    assert.equal(row.gap,'2px');assert.equal(row['align-items'],'start');
     assert.equal(row['white-space'],'normal');assert.equal(row['font-size'],'10.5px','do not shrink statistics to force a fit');
     const details=css('TurnList.vue','.assistant-meta-details',width);
-    assert.equal(details.display,'flex');assert.equal(details['flex-direction'],'column');assert.equal(details['min-width'],'0');
+    assert.equal(details.display,'flex');assert.equal(details['flex-direction'],undefined);assert.equal(details['min-width'],'0');
+    assert.equal(details['flex-wrap'],'wrap');assert.equal(details.gap,'3px 8px');
+    assert.equal(css('TurnList.vue','.assistant-message-time',width)['white-space'],'nowrap');
     assert.equal(css('TurnList.vue','.assistant-meta-separator',width).display,'none');
     const icon=css('TurnList.vue','.footer-meta-icon',width);
     assert.equal(icon.display,'block');assert.equal(icon.width,'11px');assert.equal(icon.height,'11px');
     assert.equal(css('TurnList.vue','.footer-metric',width)['white-space'],'nowrap','keep each value and its icon together');
-    assert.equal(css('TurnList.vue','.turn-token-usage',width)['flex-wrap'],'wrap');
+    assert.equal(css('TurnList.vue','.turn-token-usage',width).display,'contents','allow individual token metrics to use the remaining line width');
     assert.equal(css('TurnList.vue','.footer-token-arrow',width).display,'none','the icon replaces the text arrow, not the numeric value');
     assert.equal(css('TurnList.vue','.message-footer-actions',width)['flex-wrap'],'nowrap');
+    assert.equal(css('TurnList.vue','.message-footer-actions',width)['justify-self'],'start');
+    assert.equal(css('TurnList.vue','.message-footer-actions',width)['align-self'],'start');
     assert.equal(css('TurnList.vue','.message-footer-actions .message-icon-action',width).width,'32px');
     assert.equal(css('TurnList.vue','.message-footer-actions .message-icon-action',width).height,'32px');
   }

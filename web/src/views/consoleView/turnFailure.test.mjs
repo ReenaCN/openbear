@@ -36,6 +36,8 @@ function turnEvent(event) {
     hasMeaningfulAnswerText: (text) => Boolean(String(text || "").trim()),
     plainText: (text) => String(text || "").trim(),
     isUserInteractionEvent: () => false,
+    answerHasReasoning: (event) => Boolean(String(event?.message?.reasoning || "").trim() || event?.message?.reasoningDeferred),
+    useDeferredReasoning: ({event}) => ({text: {get value() { return String(event()?.message?.reasoning || ""); }}, loading: {value: false}, error: {value: ""}}),
     retryStatusView: () => ({label: "", tone: "neutral"}),
     retryWaitLabel: () => "",
     reactive: (value) => value,

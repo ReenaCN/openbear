@@ -77,32 +77,42 @@ const loadedDetailMatchesOperation = computed(() => {
 	const detail = object(loadedToolDetail.value);
 	return Boolean(
 		operationId.value
-		&& String(detail.opId || "") === operationId.value
-		&& Number(detail.revision || 0) >= operationRevision.value,
+		&& String(detail.opId || "") === operationId.value,
 	);
 });
-const hasLoadedToolDetail = computed(() => hasFullToolDetail(operation.value) || loadedDetailMatchesOperation.value);
+// Keep the last full body on screen while a newer revision loads. Freshness
+// still controls requests, but must not clear the user's current reading view.
+const loadedDetailIsCurrent = computed(() => loadedDetailMatchesOperation.value
+	&& Number(loadedToolDetail.value.revision || 0) >= operationRevision.value);
+const hasLoadedToolDetail = computed(() => hasFullToolDetail(operation.value) || loadedDetailIsCurrent.value);
 const detailAvailable = computed(() => Boolean(operationId.value && operation.value.detailAvailable));
 
 const displayEvent = computed(() => {
-	if (!loadedDetailMatchesOperation.value) return props.event;
+	if (!loadedDetailMatchesOperation.value || hasFullToolDetail(operation.value)) return props.event;
 	const detail = object(loadedToolDetail.value);
 	const currentOperation = operation.value;
-	const payload = {...object(currentOperation.payload), ...object(detail.payload)};
+	const currentPayload = object(currentOperation.payload);
+	const detailPayload = object(detail.payload);
+	// A retained body must never roll live status/progress back to its revision.
+	const payload = loadedDetailIsCurrent.value
+		? {...currentPayload, ...detailPayload}
+		: {...detailPayload, ...currentPayload};
 	const originalCalls = Array.isArray(props.event?.calls) ? props.event.calls : [];
 	const originalCall = object(originalCalls[0]);
 	const call = {
 		...originalCall,
 		id: String(payload.toolCallId || originalCall.id || ""),
 		name: String(payload.name || payload.toolName || originalCall.name || "Tool"),
-		arguments: String(payload.arguments ?? payload.args ?? originalCall.arguments ?? ""),
+		arguments: String(detailPayload.arguments ?? detailPayload.args ?? payload.arguments ?? payload.args ?? originalCall.arguments ?? ""),
 		preview: String(payload.preview || originalCall.preview || ""),
 	};
 	const calls = originalCalls.length
 		? originalCalls.map((item, index) => index === 0 ? call : item)
 		: [call];
-	const hasResult = hasOwn(payload, "resultText") || hasOwn(payload, "result");
-	const rawResult = hasOwn(payload, "resultText") ? payload.resultText : payload.result;
+	const resultPayload = !loadedDetailIsCurrent.value && (hasOwn(currentPayload, "resultText") || hasOwn(currentPayload, "result"))
+		? currentPayload : payload;
+	const hasResult = hasOwn(resultPayload, "resultText") || hasOwn(resultPayload, "result");
+	const rawResult = hasOwn(resultPayload, "resultText") ? resultPayload.resultText : resultPayload.result;
 	const result = hasResult ? {
 		...object(props.event?.result),
 		id: props.event?.result?.id || `op-result-${operationId.value}`,
@@ -118,7 +128,9 @@ const displayEvent = computed(() => {
 		calls,
 		result,
 		results: result ? [result] : [],
-		operation: {...currentOperation, ...detail, payload},
+		operation: loadedDetailIsCurrent.value
+			? {...currentOperation, ...detail, payload}
+			: {...detail, ...currentOperation, payload},
 	};
 });
 const toolState = computed(() => toolDisplayState(displayEvent.value, props.activeIndex, {includeDetail: props.open}));
@@ -176,7 +188,6 @@ const resultHtml = computed(() => highlightCodeHtml(resultPayload.value.content,
 const agentInfo = computed(() => agentInfoResultView(toolState.value.activeToolName, resultSource.value));
 const toolDetailNotice = computed(() => {
 	if (isContextCompaction.value) return "";
-	if (toolDetailLoading.value) return "正在读取完整工具详情…";
 	return toolDetailError.value ? `工具详情读取失败：${toolDetailError.value}` : "";
 });
 const toolDetailNoticeIsError = computed(() => Boolean(!isContextCompaction.value && toolDetailError.value));
@@ -186,7 +197,6 @@ const resultNotice = computed(() => {
 		if (compactionError.value) return `完整摘要读取失败：${compactionError.value}`;
 		return resolvedCompaction.value.emptyOutputText;
 	}
-	if (toolDetailLoading.value) return "正在读取完整工具详情…";
 	if (toolDetailError.value) return `工具详情读取失败：${toolDetailError.value}`;
 	return "等待工具结果…";
 });
@@ -221,6 +231,8 @@ async function loadToolDetail() {
 	const operationIdValue = operationId.value;
 	const requestedRevision = operationRevision.value;
 	const conversationUuid = String(props.conversationUuid || "").trim();
+	const matchesRequest = () => operationId.value === operationIdValue
+		&& String(props.conversationUuid || "").trim() === conversationUuid;
 	if (
 		!props.open
 		|| !detailAvailable.value
@@ -247,17 +259,17 @@ async function loadToolDetail() {
 				loader: requestDetail,
 			})
 			: await requestDetail();
-		if (operationId.value !== operationIdValue || String(detail.opId || "") !== operationIdValue) return;
+		if (!matchesRequest() || String(detail.opId || "") !== operationIdValue) return;
 		if (Number(detail.revision || 0) < operationRevision.value || Number(detail.revision || 0) < requestedRevision) {
 			retryForNewRevision = true;
 			return;
 		}
 		loadedToolDetail.value = detail;
 	} catch (error) {
-		toolDetailError.value = apiError(error);
+		if (matchesRequest()) toolDetailError.value = apiError(error);
 	} finally {
 		toolDetailLoading.value = false;
-		if (retryForNewRevision && props.open) void loadToolDetail();
+		if ((retryForNewRevision || !matchesRequest()) && props.open) void loadToolDetail();
 	}
 }
 
@@ -282,16 +294,12 @@ async function loadCompactionOutput() {
 	}
 }
 
-watch(() => [operationId.value, operationRevision.value], () => {
-	const detail = object(loadedToolDetail.value);
-	if (
-		String(detail.opId || "") !== operationId.value
-		|| Number(detail.revision || 0) < operationRevision.value
-	) loadedToolDetail.value = null;
+watch([() => props.conversationUuid, operationId], () => {
+	loadedToolDetail.value = null;
 	toolDetailError.value = "";
 });
 
-watch(() => [props.open, operationId.value, operationRevision.value, detailAvailable.value, isContextCompaction.value], () => {
+watch([() => props.open, () => props.conversationUuid, operationId, operationRevision, detailAvailable, isContextCompaction], () => {
 	void loadToolDetail();
 }, {immediate: true});
 

@@ -394,6 +394,20 @@ async def test_one_compact_tool_schema(service):
     assert len(json.dumps(reg.schemas())) < 6000
 
 
+@pytest.mark.parametrize("maximum,action_default,navigation_default", [(31, 17000, 31000), (12, 12000, 12000)])
+async def test_browser_timeout_schema_uses_config(service, maximum, action_default, navigation_default):
+    service.cfg.action_timeout_s = 17
+    service.cfg.navigation_timeout_s = 45
+    service.cfg.max_timeout_s = maximum
+    reg = ToolRegistry()
+    register_browser_tool(reg, service)
+    timeout = reg.schemas()[0]["parameters"]["properties"]["timeoutMs"]
+    assert timeout["maximum"] == maximum * 1000
+    assert f"{action_default} for actions" in timeout["description"]
+    assert f"{navigation_default} for navigation" in timeout["description"]
+    assert "cannot extend the system limit" in timeout["description"]
+
+
 async def test_raw_cdp_protocol_without_browser():
     seen = []
 

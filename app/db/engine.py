@@ -22,7 +22,7 @@ log = get_logger("db.engine")
 
 _SCHEMA = "\n".join(
     (Path(__file__).parent / name).read_text(encoding="utf-8")
-    for name in ("schema.sql", "user_interactions.sql", "interaction_telegram.sql", "web_telegram_replies.sql", "web_push.sql", "context_schema.sql", "runtime_schema.sql", "cron.sql")
+    for name in ("schema.sql", "user_interactions.sql", "interaction_telegram.sql", "web_telegram_replies.sql", "web_push.sql", "context_schema.sql", "runtime_schema.sql", "cron.sql", "recommendations.sql")
 )
 
 
@@ -51,6 +51,16 @@ class DB:
         await self._conn.executescript(_SCHEMA)
         await self._add_column_if_missing("web_push_deliveries", "last_status", "last_status INTEGER NOT NULL DEFAULT 0")
         await self._add_column_if_missing("web_push_deliveries", "last_error", "last_error TEXT NOT NULL DEFAULT ''")
+        for name in ("daily_page_json", "follow_page_json"):
+            await self._add_column_if_missing("rec_cursors", name, f"{name} TEXT NOT NULL DEFAULT ''")
+        # Follows are about the matter itself: what the user wants watched, and the latest finding.
+        for name, ddl in (("note", "note TEXT NOT NULL DEFAULT ''"), ("last_update", "last_update TEXT NOT NULL DEFAULT ''"),
+                          ("last_update_ms", "last_update_ms INTEGER NOT NULL DEFAULT 0")):
+            await self._add_column_if_missing("rec_follows", name, ddl)
+        # What the card could not confirm about the user's own situation, and the later review of it.
+        for name, ddl in (("to_check_json", "to_check_json TEXT NOT NULL DEFAULT '[]'"), ("review", "review TEXT NOT NULL DEFAULT ''"),
+                          ("review_issue", "review_issue TEXT NOT NULL DEFAULT ''"), ("reviewed_at_ms", "reviewed_at_ms INTEGER")):
+            await self._add_column_if_missing("rec_cards", name, ddl)
         await self._conn.executescript(reference_schema())
         await self._remove_structural_memory_categories()
         backfilled_terminal_times, repaired_web_frames = await migrate_web_operation_history(self._conn)
@@ -59,6 +69,8 @@ class DB:
         if repaired_web_frames:
             log.info("已补齐历史 Web Operation 快照帧", 数量=repaired_web_frames)
         await self._migrate_rath_schema()
+        from app.recommendations.ledger import migrate as migrate_rec_usage
+        await migrate_rec_usage(self._conn)
         await self._conn.commit()
 
         # From this point onward every application write is routed to the one

@@ -124,7 +124,7 @@ watch(() => [props.open, operationId.value, operationRevision.value, detailAvail
 						<span>{{ view.statusLabel }}<small v-if="view.statusKey === 'feedback'">原操作未获授权</small></span>
 					</div>
 					<div v-if="view.confirmText" class="readonly-text-answer">
-						<span>反馈内容<small v-if="view.selectedDecisionLabel"> · 原选择：{{ view.selectedDecisionLabel }}</small></span>
+						<span>{{ view.statusKey === 'confirmed_with_changes' ? '授权附言（执行时必须遵守）' : view.statusKey === 'rejected' ? '拒绝原因' : '反馈内容' }}<small v-if="view.selectedDecisionLabel && view.statusKey === 'feedback'"> · 原选择：{{ view.selectedDecisionLabel }}</small></span>
 						<div>{{ view.confirmText }}</div>
 					</div>
 				</template>

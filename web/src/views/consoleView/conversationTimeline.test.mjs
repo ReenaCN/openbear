@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import {readFileSync} from "node:fs";
 
 import {conversationTimelineEntries, isConversationTimelineEvent, shouldRenderAssistantDivider} from "./conversationTimeline.js";
+import {applyOperationFrame, deriveOperationRunState, projectOperationMessages} from "../../timelineProjection.js";
 
 const turnListSource = readFileSync(new URL("./TurnList.vue", import.meta.url), "utf8");
-const workDetailPanelSource = readFileSync(new URL("./TurnWorkDetailPanel.vue", import.meta.url), "utf8");
 const agentToolNames = new Set(["Agent", "AgentMessage", "AgentStop"]);
 const isAgentFixture = (event) => agentToolNames.has(event?.toolName);
 const canonicalCompaction = {
@@ -35,6 +35,55 @@ test("main conversation keeps durable interruptions, model retries, and context 
 
 	assert.deepEqual(entries.map(({index}) => index), [0, 3, 4, 5, 6, 7]);
 	assert.equal(entries[2].event.preview, "先停一下");
+});
+
+for (const [name, payload] of [
+	["typed runtime notice", {text: "运行时提示正文", runtimeNotice: true}],
+	["historical progress reminder", {text: "已 15 分钟以上没有推进，已提醒模型重新审视状态（第 1 次）", level: "info", footer: ""}],
+]) {
+	test(`${name} remains visible after live updates and reload`, () => {
+		const store = {};
+		const frame = {opId: "notice:progress-1", opType: "notice", turnUuid: "turn-1", displaySeq: 20,
+			action: "create", revision: 1, createdAtMs: 1000, updatedAtMs: 1000, payload};
+		assert.equal(applyOperationFrame(store, frame), true);
+		const entries = (operations) => conversationTimelineEntries(projectOperationMessages(operations)
+			.flatMap((message) => message.localTimeline || []));
+		const live = entries([...store.operationsById.values()]);
+		assert.equal(live.length, 1);
+		assert.equal(live[0].event.status, payload.text);
+		assert.equal(live[0].event.runtimeNotice, true);
+		assert.equal(live[0].event.active, false);
+		assert.equal(deriveOperationRunState([...store.operationsById.values()]).running, false);
+
+		applyOperationFrame(store, {opId: "run:1", opType: "run", turnUuid: "turn-1", displaySeq: 10,
+			revision: 1, payload: {status: "running"}});
+		applyOperationFrame(store, {opId: "status:1", opType: "status", turnUuid: "turn-1", displaySeq: 30,
+			revision: 1, payload: {statusText: "正在思考 …"}});
+		applyOperationFrame(store, {opId: "answer:1", opType: "assistant_message", turnUuid: "turn-1", displaySeq: 40,
+			revision: 1, payload: {text: "继续执行", complete: true}});
+		assert.equal(applyOperationFrame(store, frame), false);
+		const updated = [...store.operationsById.values()];
+		assert.equal(deriveOperationRunState(updated).running, true);
+		for (const snapshot of [updated, JSON.parse(JSON.stringify(updated))]) {
+			const visible = entries(snapshot);
+			assert.equal(visible.length, 2);
+			assert.equal(visible[0].event.id, frame.opId);
+			assert.equal(visible[0].event.status, payload.text);
+			assert.equal(visible[1].event.message.content, "继续执行");
+		}
+	});
+}
+
+test("ordinary notices and non-notice status text do not become runtime reminders", () => {
+	for (const operation of [
+		{opType: "notice", payload: {text: "（已停止）"}},
+		{opType: "notice", payload: {text: "任务完成", taskUuid: "agent-1", notification: true}},
+		{opType: "run_control", payload: {text: "已 15 分钟以上没有推进，已提醒模型重新审视状态（第 1 次）"}},
+	]) {
+		const events = projectOperationMessages([{opId: "other", turnUuid: "turn-1", displaySeq: 10, ...operation}])
+			.flatMap((message) => message.localTimeline || []);
+		assert.equal(conversationTimelineEntries(events).length, 0);
+	}
 });
 
 test("Agent and ordinary tools keep their source positions in the working timeline", () => {
@@ -72,7 +121,6 @@ test("failed Agent stays out of the main conversation but remains available to w
 
 	assert.deepEqual(entries.map(({event}) => event.id), ["running", "completed", "partial", "cancelled"]);
 	assert.equal(events.length, 6, "main timeline filtering must not delete source work events");
-	assert.match(workDetailPanelSource, /sourceEvents = computed\(\(\) => Array\.isArray\(props\.turn\?\.events\) \? props\.turn\.events : \[\]\)/);
 });
 
 test("typed and legacy UserInteraction remain alongside ordinary work events", () => {

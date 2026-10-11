@@ -48,6 +48,8 @@ from app.tools.openbear_control import register_openbear_control_tool
 from app.tools.webhook import register_webhook_tool
 from app.tools.cron import register_cron_tool
 from app.cron.service import CronService
+from app.recommendations.service import RecommendationService
+from app.tools.recommendation import register_recommendation_tool
 from app.webhooks.service import WebhookService
 from app.webhooks.runtime_bridge import RuntimeBridge
 from app.webhooks.worker import Worker
@@ -133,6 +135,8 @@ class Services:
         self.webhook_worker = Worker(self.webhooks)
         self.cron = CronService(self.db, self.web_admin)
         self.web_admin.cron = self.cron
+        self.recommendations = RecommendationService(self.db, self.web_admin)
+        self.web_admin.recommendations = self.recommendations
 
         # 工具注册
         self.file_state = FileStateStore(config.tools.file_state_max_entries)
@@ -160,6 +164,7 @@ class Services:
         register_openbear_control_tool(self.tools, self)
         register_webhook_tool(self.tools, self.webhooks)
         register_cron_tool(self.tools, self.cron)
+        register_recommendation_tool(self.tools, self.recommendations)
         register_browser_tool(self.tools, self.browser)
         register_agent_tools(
             self.tools,
@@ -178,6 +183,7 @@ class Services:
         all_skills = load_skills(config.tools.skills_dir)
         result = filter_skills(all_skills, disabled_names=set(config.tools.disabled_skills or []))
         self.skills = result.included
+        self.web_admin.skills = self.skills
 
         self.web_admin.skills_prompt = render_skills_block(self.skills)
         self.web_admin.skills_count = len(self.skills)
@@ -246,6 +252,7 @@ class Services:
         await self.web_admin.start()
         await self.webhook_worker.start()
         await self.cron.start()
+        await self.recommendations.start()
         await self.update.start()
         log.info("服务已启动", 工具数=len(self.tools.names()), skills=len(self.skills),
                  主力模型=self.selection.current)
@@ -689,6 +696,7 @@ class Services:
         register_openbear_control_tool(self.tools, self)
         register_webhook_tool(self.tools, self.webhooks)
         register_cron_tool(self.tools, self.cron)
+        register_recommendation_tool(self.tools, self.recommendations)
         register_browser_tool(self.tools, self.browser)
         register_agent_tools(
             self.tools,
@@ -708,6 +716,7 @@ class Services:
         all_skills = load_skills(config.tools.skills_dir)
         result = filter_skills(all_skills, disabled_names=set(config.tools.disabled_skills or []))
         self.skills = result.included
+        self.web_admin.skills = self.skills
         self.web_admin.skills_prompt = render_skills_block(self.skills)
         self.web_admin.skills_count = len(self.skills)
         self.web_admin.workspace_dir = self.workspace_dir
@@ -991,6 +1000,7 @@ class Services:
                  工具数=len(self.tools.names()), skills=len(self.skills), MCP热重载=mcp_changed)
 
     async def shutdown(self) -> None:
+        await self.recommendations.close()
         await self.cron.close()
         await self.webhook_worker.close()
         if self._browser_validation_task:

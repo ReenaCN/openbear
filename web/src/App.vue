@@ -17,6 +17,8 @@ import ConsoleMarkdown from "./views/consoleView/ConsoleMarkdown.vue";
 import draggable from "vuedraggable";
 import { ElMessage, ElMessageBox, ElNotification } from "element-plus";
 import { Box, ChatLineRound, Check, Close, DataAnalysis, Delete, DocumentCopy, EditPen, Loading, Monitor, Moon, MoreFilled, Plus, Refresh, RefreshLeft, Setting, Star, StarFilled, Sunny } from "@element-plus/icons-vue";
+import RecommendationEntryIcon from "./components/recommendations/RecommendationEntryIcon.vue";
+import {recommendationBadge, startRecommendationBadge} from "./components/recommendations/recBadge.js";
 import { Api, apiError } from "./api";
 import {
   isLocalConversationRow as isLocalConversation,
@@ -55,6 +57,7 @@ const McpView = defineLazyView(() => import("./views/McpView.vue"), "MCP 管理"
 const SettingsHubView = defineLazyView(() => import("./views/SettingsHubView.vue"), "设置");
 const StatisticsView = defineLazyView(() => import("./views/StatisticsView.vue"), "数据统计");
 const WebhooksView = defineLazyView(() => import('./views/WebhooksView.vue'), '触发器总览');
+const RecommendationsView = defineLazyView(() => import('./views/RecommendationsView.vue'), '推荐');
 
 const nav = [
   { key: "memory", label: "记忆管理", shortLabel: "记忆", icon: "Collection", component: MemoryView },
@@ -66,6 +69,7 @@ const nav = [
   { key: "settings", label: "设置", shortLabel: "设置", icon: "Setting", component: SettingsHubView },
   { key: "statistics", label: "数据统计", shortLabel: "统计", icon: "DataAnalysis", component: StatisticsView, headerOnly: true },
   { key: 'webhooks', label: '触发器总览', shortLabel: '触发器', icon: 'Connection', component: WebhooksView, headerOnly: true },
+  { key: 'recommendations', label: '推荐', shortLabel: '推荐', icon: 'Opportunity', component: RecommendationsView, headerOnly: true },
 ];
 const pageToPath = {
   console: "/chat",
@@ -78,6 +82,7 @@ const pageToPath = {
   settings: "/settings",
   statistics: "/statistics",
   webhooks: '/webhooks',
+  recommendations: '/recommendations',
 };
 const pathToPage = {
   "/": "console",
@@ -91,6 +96,7 @@ const pathToPage = {
   "/settings": "settings",
   "/statistics": "statistics",
   '/webhooks': 'webhooks',
+  '/recommendations': 'recommendations',
 };
 
 const desktopNav = computed(() => nav.filter((n) => n.key !== "settings" && !n.headerOnly));
@@ -138,6 +144,80 @@ function handleCronFolderChanged(folderId) {
 }
 function openCronConversation(conversationId) {
   if (conversationId) openConversation({conversationUuid:conversationId});
+}
+function handleOpenRecommendations() { selectNav('recommendations'); }
+const pendingRecommendationDraft = ref(null);
+let openingRecommendationDraft = false;
+// Unlike ordinary autosave, replacement must not treat unreadable storage as
+// an empty draft. Keep this strict queue separate from best-effort deletion.
+const recommendationAttachmentDrafts = createAttachmentDraftStorage({onError(error) { throw error; }});
+async function readRecommendationDraftState() {
+  const attachments = await recommendationAttachmentDrafts.load(LOCAL_CONVERSATION_UUID);
+  const drafts = JSON.parse(window.localStorage.getItem("openbear.console.drafts.v1") || "{}");
+  if (!drafts || typeof drafts !== "object" || Array.isArray(drafts)) throw new Error("invalid_draft_store");
+  return {
+    text: String(drafts[LOCAL_CONVERSATION_UUID] || ""),
+    attachmentIds: [...new Set([...attachments.items, ...attachments.skipped].map(item => item.id))].sort(),
+  };
+}
+// A recommendation fills a fresh composer; it never sends or carries over old
+// files. Persisted drafts need protection even before their sidebar row exists.
+async function openRecommendationDraft(draft) {
+  if (openingRecommendationDraft || active.value !== 'recommendations') return;
+  openingRecommendationDraft = true;
+  const initialNavigation = navigationSequence;
+  try {
+    const previous = await readRecommendationDraftState();
+    if (active.value !== 'recommendations' || navigationSequence !== initialNavigation) return;
+    if (previous.text.trim() || previous.attachmentIds.length) {
+      try {
+        await ElMessageBox.confirm("已有一个未发送的新会话草稿。要用这张推荐替换它吗？原草稿的文字和待发送附件会一并清除。", "接着聊", {
+          confirmButtonText: "替换", cancelButtonText: "取消", type: "warning" });
+      } catch { return; }
+    }
+    if (active.value !== 'recommendations' || navigationSequence !== initialNavigation) return;
+    await navigateFromCron(async () => {
+      const navigation = navigationSequence;
+      const isCurrent = () => active.value === 'recommendations' && navigationSequence === navigation;
+      const current = await readRecommendationDraftState();
+      if (!isCurrent()) return;
+      if (JSON.stringify(current) !== JSON.stringify(previous)) {
+        ElMessage.warning("草稿已变化，未替换。请重新点击接着聊。");
+        return;
+      }
+      // Remove only the confirmed IDs, never a whole record that may now hold
+      // another tab's unconfirmed files. Await the cleanup before mounting chat.
+      if (previous.attachmentIds.length && !await recommendationAttachmentDrafts.removeItems(LOCAL_CONVERSATION_UUID, previous.attachmentIds)) {
+        throw new Error("attachment_draft_cleanup_failed");
+      }
+      const remaining = await readRecommendationDraftState();
+      if (!isCurrent()) return;
+      if (remaining.text !== previous.text || remaining.attachmentIds.length) {
+        ElMessage.warning("草稿已变化，未替换。请重新点击接着聊。");
+        return;
+      }
+      writeLocalDraftText(String(draft.text || ""));
+      pendingRecommendationDraft.value = {...draft, nonce: Date.now()};
+      setDraftFolderId(String(draft.folderId || ""));
+      setConversationsIfChanged(conversations.value.map((row) => isLocalConversation(row) ? { ...row, folderId: draftFolderId.value, parentId: draftFolderId.value } : row));
+      focusLocalConversation(draftFolderId.value);
+      await nextTick();
+      window.dispatchEvent(new CustomEvent("openbear:recommendation-draft", {detail: pendingRecommendationDraft.value}));
+    });
+  } catch {
+    ElMessage.error("无法安全读取或清理本地草稿，未打开推荐续聊，请重试。");
+  } finally {
+    openingRecommendationDraft = false;
+  }
+}
+function writeLocalDraftText(text) {
+  try {
+    const key = "openbear.console.drafts.v1";
+    const drafts = JSON.parse(window.localStorage.getItem(key) || "{}");
+    const next = drafts && typeof drafts === "object" && !Array.isArray(drafts) ? drafts : {};
+    next[LOCAL_CONVERSATION_UUID] = text;
+    window.localStorage.setItem(key, JSON.stringify(next));
+  } catch { /* The live event below still fills the mounted composer. */ }
 }
 const pageHeaderReady = ref(false);
 // Keep fallback navigation available while a newly selected lazy page loads.
@@ -1059,6 +1139,7 @@ onMounted(() => {
   });
   window.addEventListener("popstate", handleHistoryNavigation);
   window.addEventListener('openbear:open-cron', handleOpenCron);
+  window.addEventListener('openbear:open-recommendations', handleOpenRecommendations);
   window.addEventListener("openbear:conversations-refresh", handleExternalConversationsRefresh);
   window.addEventListener("click", closeConversationMenu);
   window.addEventListener("scroll", closeConversationMenu, true);
@@ -1066,6 +1147,7 @@ onMounted(() => {
   window.addEventListener("keydown", handleConversationMenuKeydown);
   if (!isLoginPath) {
     startReferenceCatalog();
+    startRecommendationBadge();
     void loadVersionInfo().finally(scheduleVersionPoll);
     void refreshChannelStats();
     window.addEventListener("focus", checkVersionOnResume);
@@ -1084,6 +1166,7 @@ onBeforeUnmount(() => {
   stopThemeSubscription();
   window.removeEventListener("popstate", handleHistoryNavigation);
   window.removeEventListener('openbear:open-cron', handleOpenCron);
+  window.removeEventListener('openbear:open-recommendations', handleOpenRecommendations);
   window.removeEventListener("openbear:conversations-refresh", handleExternalConversationsRefresh);
   window.removeEventListener("click", closeConversationMenu);
   window.removeEventListener("scroll", closeConversationMenu, true);
@@ -1100,7 +1183,7 @@ onBeforeUnmount(() => {
 
 <template>
   <LoginView v-if="isLoginPath" />
-  <div v-else class="app-shell h-full flex" :class="{'is-console': active === 'console', 'is-settings': active === 'settings' && pageHeaderReady, 'is-admin': ['memory', 'secrets', 'docs', 'cron', 'skills', 'mcp'].includes(active) && pageHeaderReady}">
+  <div v-else class="app-shell h-full flex" :class="{'is-console': active === 'console', 'is-settings': active === 'settings' && pageHeaderReady, 'is-admin': ['memory', 'secrets', 'docs', 'cron', 'skills', 'mcp', 'recommendations'].includes(active) && pageHeaderReady}">
     <NotificationOnboarding />
     <div class="mobile-app-bar">
       <button
@@ -1152,6 +1235,19 @@ onBeforeUnmount(() => {
             @click="selectNav('statistics')"
           >
             <el-icon :size="14"><DataAnalysis /></el-icon>
+          </button>
+          <button
+            type="button"
+            class="theme-entry statistics-entry rec-entry"
+            :class="{'is-active': active === 'recommendations', 'has-unseen': recommendationBadge.unseen > 0}"
+            :title="recommendationBadge.unseen ? `推荐：${recommendationBadge.unseen} 条新推荐` : '推荐'"
+            :aria-label="recommendationBadge.unseen ? `打开推荐，${recommendationBadge.unseen} 条新推荐` : '打开推荐'"
+            :aria-current="active === 'recommendations' ? 'page' : undefined"
+            data-testid="recommendations-entry"
+            @click="selectNav('recommendations')"
+          >
+            <RecommendationEntryIcon :size="14" />
+            <span v-if="recommendationBadge.unseen" class="rec-entry-badge">{{ recommendationBadge.unseen > 99 ? '99+' : recommendationBadge.unseen }}</span>
           </button>
           <el-dropdown trigger="click" placement="bottom-end" @command="chooseThemeMode">
             <button
@@ -1221,6 +1317,7 @@ onBeforeUnmount(() => {
           ref="conversationTreeRef"
           :active-conversation-uuid="activeConversationUuid"
           :draft-conversation="currentDraftConversation()"
+          :auto-open-selected="active !== 'recommendations'"
           @open="handleTreeOpen"
           @new-conversation="handleTreeNewConversation"
           @rows="handleTreeRows"
@@ -1471,6 +1568,8 @@ onBeforeUnmount(() => {
         :conversation-path="activeConversationPath"
         :navigation-obscured="sidebarOpen"
         :folder-id="isLocalConversation(activeConversationUuid) ? draftFolderId : selectedFolderId"
+        :recommendation-draft="pendingRecommendationDraft"
+        @recommendation-draft-applied="pendingRecommendationDraft = null"
         @conversation-created="handleConsoleConversationCreated"
         @conversations-refresh="handleConsoleRefreshList"
         @properties="openConversationProperties({conversationUuid:activeConversationUuid,title:activeConversationTitle})"
@@ -1479,11 +1578,22 @@ onBeforeUnmount(() => {
           <button
             type="button"
             class="mobile-sidebar-toggle"
+            :class="{'has-rec-unseen': recommendationBadge.unseen > 0}"
             :aria-expanded="sidebarOpen"
             aria-controls="openbear-sidebar"
             aria-label="打开导航"
             @click="sidebarOpen = true"
           ><span></span><span></span><span></span></button>
+        </template>
+        <template #mobile-recommendations>
+          <button
+            v-if="recommendationBadge.unseen > 0"
+            type="button"
+            class="mobile-rec-pill"
+            :aria-label="`${recommendationBadge.unseen} 条新推荐，打开推荐页`"
+            data-testid="mobile-recommendations-entry"
+            @click="selectNav('recommendations')"
+          ><RecommendationEntryIcon :size="13" /><span>{{ recommendationBadge.unseen > 99 ? '99+' : recommendationBadge.unseen }}</span></button>
         </template>
       </ConsoleView>
       <MemoryView v-else-if="active === 'memory'" :active-type="memoryType" @type-changed="handleMemoryTypeChanged" @mobile-header-ready="pageHeaderReady = $event">
@@ -1509,11 +1619,12 @@ onBeforeUnmount(() => {
         @open-conversation="openCronConversation"
         @section-changed="handleSettingsSectionChanged"
         @open-webhook-properties="openWebhookProperties"
+        @open-recommendation-draft="openRecommendationDraft"
         @mobile-header-ready="pageHeaderReady = $event"
       >
         <template #mobile-navigation>
           <button
-            v-if="['settings', 'secrets', 'docs', 'cron', 'skills', 'mcp'].includes(active)"
+            v-if="['settings', 'secrets', 'docs', 'cron', 'skills', 'mcp', 'recommendations'].includes(active)"
             type="button"
             class="mobile-sidebar-toggle"
             :aria-expanded="sidebarOpen"
@@ -1636,6 +1747,56 @@ onBeforeUnmount(() => {
 }
 .theme-entry:focus-visible {
   box-shadow: 0 0 0 3px var(--ob-focus);
+}
+.rec-entry { position: relative; }
+.rec-entry.has-unseen { color: var(--ob-text); }
+.rec-entry-badge {
+  /* Anchored to the 14px icon at the button's centre, so it hugs the glyph at any button size. */
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(1px, -15px);
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  box-sizing: border-box;
+  border: 1.5px solid var(--ob-sidebar);
+  border-radius: 999px;
+  background: var(--ob-danger);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 12px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+.mobile-sidebar-toggle.has-rec-unseen { position: relative; }
+.mobile-sidebar-toggle.has-rec-unseen::after {
+  content: "";
+  position: absolute;
+  top: 10px;
+  right: 9px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ob-danger);
+  box-shadow: 0 0 0 1.5px var(--ob-chat-bg);
+}
+.mobile-rec-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid rgb(var(--ob-blue-rgb) / .28);
+  border-radius: 999px;
+  background: var(--ob-blue-soft);
+  color: var(--ob-blue);
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .statistics-entry.is-active {
   border-color: var(--ob-focus);

@@ -1,19 +1,49 @@
 <script setup>
-import {computed, ref} from 'vue';
-import {Brain, SquareTerminal, Search, FileText, FilePenLine, PencilLine, Globe, History, BookOpen, Wrench, ChevronRight, ListChecks} from '@lucide/vue';
+import {computed, inject, ref, watch} from 'vue';
+import {Brain, SquareTerminal, Search, FileText, FilePenLine, PencilLine, Globe, History, BookOpen, Wrench, ChevronRight, ChevronUp, ListChecks} from '@lucide/vue';
 import ConsoleToolEvent from './ConsoleToolEvent.vue';
 import WorkDisclosure from './WorkDisclosure.vue';
 import {eventPrimaryToolName, toolDisplayState, toolPreview as argumentToolPreview, toolStatus} from './display.js';
-import {processToolLabel, reasoningDuration, workDurationLabel} from './conversationWork.js';
+import {processToolLabel, reasoningDuration, workDurationLabel, WORK_MOTION} from './conversationWork.js';
 import {reasoningPreviewState, reasoningPreviewDirective as vReasoningPreview} from './reasoningPreview.js';
+import {useDeferredReasoning} from './reasoningDetail.js';
 
 const props = defineProps({event: {type: Object, required: true}, part: {type: String, default: ''},
 	conversationUuid: {type: String, default: ''}, activeIndex: {type: Number, default: 0}});
 const emit = defineEmits(['select-tab']);
 const open = ref(false);
 const groupActive = ref({});
+const summaryButton = ref(null);
+const toolContent = ref(null);
+const showCollapse = ref(false);
+const motion = inject(WORK_MOTION, null);
+watch(toolContent, (el, _, onCleanup) => {
+	showCollapse.value = false;
+	if (!el) return;
+	const viewport = el.closest('.console-scroll');
+	const measure = () => {
+		const height = viewport?.clientHeight || window.innerHeight || 600;
+		showCollapse.value = el.getBoundingClientRect().height > Math.min(320, Math.max(140, height * .6));
+	};
+	measure();
+	if (typeof ResizeObserver === 'undefined') return;
+	const observer = new ResizeObserver(measure);
+	observer.observe(el);
+	if (viewport) observer.observe(viewport);
+	onCleanup(() => observer.disconnect());
+}, {flush: 'post'});
+function collapseTool() {
+	motion?.reveal?.(summaryButton.value);
+	summaryButton.value?.focus({preventScroll: true});
+	open.value = false;
+}
 const isReasoning = computed(() => props.part === 'reasoning' || props.event.kind === 'answer');
-const reasoning = computed(() => String(props.event.message?.reasoning || ''));
+const deferredReasoning = useDeferredReasoning({
+	event: () => props.event,
+	open: () => open.value && isReasoning.value,
+	conversationUuid: () => props.conversationUuid,
+});
+const reasoning = computed(() => deferredReasoning.text.value);
 const groupEvents = computed(() => Array.isArray(props.event.events) ? props.event.events : []);
 const state = computed(() => {
 	const value = toolDisplayState(props.event, props.activeIndex);
@@ -66,7 +96,7 @@ const vReasoningScroll = {
 
 <template>
 	<div class="conversation-process" :class="{'is-running': running, 'is-open': open, 'is-reasoning': isReasoning}">
-		<button type="button" class="process-summary" :aria-expanded="open" @click="open = !open">
+		<button ref="summaryButton" type="button" class="process-summary" :aria-expanded="open" @click="open = !open">
 			<component :is="processIcon" class="process-icon" :stroke-width="1.75" aria-hidden="true"/>
 			<span class="process-copy">
 			<span class="process-kind" :class="{'work-status-sweep': running}">{{ isReasoning ? (running ? '正在思考' : '思考') : toolLabel }}</span>
@@ -86,11 +116,16 @@ const vReasoningScroll = {
 		</button>
 		<WorkDisclosure :open="open">
 			<div v-if="isReasoning" class="process-reasoning-detail">
-				<div v-reasoning-scroll class="process-reasoning-scroll" tabindex="0" aria-label="思考内容，可滚动"><div>{{ reasoning }}</div></div>
+				<div v-reasoning-scroll class="process-reasoning-scroll" tabindex="0" aria-label="思考内容，可滚动"><div>{{ reasoning || (deferredReasoning.error.value ? `思考内容读取失败：${deferredReasoning.error.value}` : deferredReasoning.loading.value ? '正在读取思考内容…' : '') }}</div></div>
 			</div>
 			<div v-else class="process-tool-detail">
-				<template v-if="groupEvents.length"><ConsoleToolEvent v-for="(event, i) in groupEvents" :key="event.id || i" :event="event" :conversation-uuid="props.conversationUuid" :open="true" :active-index="groupActive[event.id || i] || 0" @select-tab="groupActive[event.id || i] = $event"/></template>
-				<ConsoleToolEvent v-else :event="props.event" :conversation-uuid="props.conversationUuid" :open="true" detail-only :active-index="props.activeIndex" @select-tab="emit('select-tab', $event)"/>
+				<div ref="toolContent" class="process-tool-content">
+					<template v-if="groupEvents.length"><ConsoleToolEvent v-for="(event, i) in groupEvents" :key="event.id || i" :event="event" :conversation-uuid="props.conversationUuid" :open="true" :active-index="groupActive[event.id || i] || 0" @select-tab="groupActive[event.id || i] = $event"/></template>
+					<ConsoleToolEvent v-else :event="props.event" :conversation-uuid="props.conversationUuid" :open="true" detail-only :active-index="props.activeIndex" @select-tab="emit('select-tab', $event)"/>
+				</div>
+				<div v-if="showCollapse" class="process-collapse-dock">
+					<button type="button" class="process-collapse-button" aria-label="收起工具详情" @click.stop="collapseTool"><ChevronUp :size="16" aria-hidden="true"/><span>收起</span></button>
+				</div>
 			</div>
 		</WorkDisclosure>
 	</div>
@@ -129,6 +164,13 @@ const vReasoningScroll = {
 .process-reasoning-scroll[data-mask-top="true"] { mask-image: linear-gradient(to bottom, transparent, #000 16px); }
 .process-reasoning-scroll[data-mask-top="true"][data-mask-bottom="true"] { mask-image: linear-gradient(to bottom, transparent, #000 16px, #000 calc(100% - 16px), transparent); }
 .process-tool-detail { min-width: 0; padding-top: 10px; }
+.process-tool-content { min-width: 0; }
+.process-collapse-dock { display: none; }
+@media (max-width: 760px) {
+	.process-collapse-dock { display: flex; justify-content: flex-end; position: sticky; bottom: 12px; z-index: 3; height: 52px; padding: 8px 8px 0; pointer-events: none; }
+	.process-collapse-button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 80px; height: 44px; padding: 0 12px; border: 1px solid var(--ob-chat-border); border-radius: 999px; background: rgb(var(--ob-surface-rgb) / .88); color: var(--ob-chat-text); box-shadow: 0 4px 18px rgb(var(--ob-shadow-rgb) / .12); -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px); font: inherit; font-size: 12px; cursor: pointer; pointer-events: auto; }
+	.process-collapse-button:focus-visible { outline: 2px solid var(--ob-focus); outline-offset: 3px; }
+}
 /* One quiet shell, like ZCode's terminal panel — not a card around a second
    bordered detail box around a third set of bordered code blocks. */
 .process-tool-detail :deep(.tool-event) { margin: 0; border: 1px solid var(--work-panel-rule); border-radius: 12px; background: var(--work-panel); color: var(--work-detail-text); font-size: 13px; box-shadow: none; }

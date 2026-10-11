@@ -8,6 +8,8 @@ import ConsoleUserInteractionEvent from "./ConsoleUserInteractionEvent.vue";
 import {isAgentEvent, modelRetryReasonLabel, toolResultKey, toolStatus} from "./display.js";
 import {answerContent, hasMeaningfulAnswerText} from "./markdown.js";
 import {isUserInteractionEvent} from "./userInteractionPresentation.js";
+import {answerHasReasoning} from "../../timelineProjection.js";
+import {useDeferredReasoning} from "./reasoningDetail.js";
 import {retryWaitLabel as formatRetryWait, retryStatusView} from "./modelRetryPresentation.js";
 
 const props = defineProps({
@@ -74,6 +76,12 @@ function toggleDetails(event, kind, ...rest) {
 	emit("details-toggle", event, key(kind, ...rest));
 }
 
+const deferredReasoning = useDeferredReasoning({
+	event: () => props.event,
+	open: () => props.event?.kind === "answer" && props.showReasoning && isOpen("reasoning"),
+	conversationUuid: () => props.conversationUuid,
+});
+
 function toggleReasoning(event) {
 	emit("reasoning-toggle", event, key("reasoning"), Boolean(props.event?.reasoningActive));
 }
@@ -130,7 +138,7 @@ function isFailureAnswer(event = {}) {
 	<div v-if="props.event.kind === 'answer'" class="answer-block"
 	     :class="{ 'answer-has-text': hasMeaningfulAnswerText(props.event.message.content || ''), 'answer-is-error': isFailureAnswer(props.event) }">
 		<details
-			v-if="props.showReasoning && props.event.message.reasoning"
+			v-if="props.showReasoning && answerHasReasoning(props.event)"
 			:key="`${key('reasoning')}-${props.event.reasoningActive ? 'live' : 'done'}`"
 			class="reasoning-card tool-event"
 			:class="{ 'process-live': props.event.reasoningActive }"
@@ -144,7 +152,7 @@ function isFailureAnswer(event = {}) {
 			</summary>
 			<div v-if="props.event.reasoningActive || isOpen('reasoning')" class="reasoning-body"
 			     v-reasoning-autoscroll="props.reasoningAutoscroll">
-				<ConsoleMarkdown :text="props.event.message.reasoning" :live="props.liveTextTarget === 'reasoning'"/>
+				<ConsoleMarkdown :text="deferredReasoning.text.value || (deferredReasoning.error.value ? `思考内容读取失败：${deferredReasoning.error.value}` : deferredReasoning.loading.value ? '正在读取思考内容…' : '')" :live="props.liveTextTarget === 'reasoning'"/>
 			</div>
 		</details>
 		<p v-if="isFailureAnswer(props.event)" class="answer-error-banner">

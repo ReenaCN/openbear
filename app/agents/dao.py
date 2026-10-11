@@ -1293,6 +1293,83 @@ class AgentDAO(AgentContinuityDAO):
             )
         return [self._event_from_row(r) for r in await cur.fetchall() if r is not None]
 
+    async def last_supervision_snapshot(
+        self, *, chat_id: int, conversation_uuid: str, root_turn_uuid: str,
+    ) -> dict[str, Any]:
+        """Resume only a durably delivered AgentWait page, never a pending read.
+
+        The transcript is the receipt: cancellation before save must replay the
+        page. Compaction retains these rows; turn deletion removes the receipt.
+        Redundant/failed waits without an agents snapshot cannot erase cursors.
+        """
+        cur = await self._db.conn.execute(
+            """SELECT content FROM messages
+               WHERE chat_id=? AND conversation_uuid=? AND run_root_turn_uuid=?
+                 AND role='tool' AND name='AgentWait' AND task_uuid=''
+                 AND CASE WHEN json_valid(content)
+                     THEN json_type(content, '$.agents') END='array'
+               ORDER BY id DESC LIMIT 1""",
+            (chat_id, conversation_uuid, root_turn_uuid),
+        )
+        row = await cur.fetchone()
+        return _json_loads(row["content"], {}) if row else {}
+
+    async def supervision_events(
+        self, task_uuid: str, *, after_seq: int = 0, limit: int = 50,
+        controller_visible: bool = False,
+    ) -> dict[str, Any]:
+        """A lossless review page plus current facts, independent of page backlog.
+
+        Keep the ordinary events() tail/polling contract unchanged. All queries
+        below share an event high-water mark; later appends belong to next review.
+        """
+        latest = await self.events(task_uuid, limit=1)
+        high_water = latest[-1].seq if latest else 0
+        limit = max(1, min(200, int(limit)))
+        # Match controller_projection._project_event BEFORE pagination so
+        # transport telemetry cannot hide a control receipt behind empty pages.
+        # The same predicate has a partial index in schema.sql.
+        visible = """AND kind NOT GLOB 'model_*'
+                     AND kind NOT IN ('tool_call_started', 'tool_call_finished')""" if controller_visible else ""
+        cur = await self._db.conn.execute(
+            f"""SELECT * FROM rath_task_events
+               WHERE task_uuid=? AND seq>? AND seq<=? {visible}
+               ORDER BY seq ASC LIMIT ?""",
+            (task_uuid, after_seq, high_water, limit + 1),
+        )
+        rows = await cur.fetchall()
+        page = [self._event_from_row(row) for row in rows[:limit]]
+        kinds = (
+            "model_call_started", "model_call_finished", "model_stream_interrupted",
+            "model_stream_progress", "tool_call_started", "tool_call_finished",
+            "model_call_retry_wait", "model_call_retry_resumed",
+            "pause_applied", "needs_openbear_control",
+            "plan_submitted", "plan_replan_submitted",
+        )
+        # One indexed seek per kind, including absent kinds. GROUP BY/MAX over
+        # seq<=high_water would scan the task's entire history on every review.
+        values = ",".join("(?)" for _ in kinds)
+        cur = await self._db.conn.execute(
+            f"""WITH kinds(kind) AS (VALUES {values})
+                SELECT event.* FROM kinds JOIN rath_task_events AS event
+                  ON event.task_uuid=? AND event.seq=(
+                    SELECT seq FROM rath_task_events
+                    WHERE task_uuid=? AND kind=kinds.kind AND seq<=?
+                    ORDER BY seq DESC LIMIT 1
+                  ) ORDER BY event.seq""",
+            (*kinds, task_uuid, task_uuid, high_water),
+        )
+        current = [self._event_from_row(row) for row in await cur.fetchall()]
+        return {
+            "events": page, "latest": latest[-1] if latest else None,
+            "current": current, "highWater": high_water,
+            "hasMore": len(rows) > limit,
+            # Once the visible page is exhausted, hidden telemetry through the
+            # same high-water is also consumed, not endlessly revisited.
+            "nextAfter": high_water if controller_visible and len(rows) <= limit
+                else page[-1].seq if page else after_seq,
+        }
+
     async def events_before(
         self,
         task_uuid: str,

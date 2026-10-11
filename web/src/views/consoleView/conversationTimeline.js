@@ -1,4 +1,4 @@
-import {isContextCompactionOperation} from "../../timelineProjection.js";
+import {answerHasReasoning, isContextCompactionOperation} from "../../timelineProjection.js";
 import {isUserInteractionEvent} from "./userInteractionPresentation.js";
 
 function agentEventStatus(event = {}) {
@@ -16,8 +16,8 @@ function isFailedAgentEvent(event = {}) {
 }
 
 export function isConversationTimelineEvent(event, _primaryToolName = "", agentEvent = false) {
-	if (event?.kind === "answer") return Boolean(String(event?.message?.content || "").trim() || String(event?.message?.reasoning || "").trim());
-	if (event?.kind === "live_status") return Boolean(event?.persistentRunIndicator || event?.interruption);
+	if (event?.kind === "answer") return Boolean(String(event?.message?.content || "").trim() || answerHasReasoning(event));
+	if (event?.kind === "live_status") return Boolean(event?.persistentRunIndicator || event?.interruption || event?.runtimeNotice);
 	if (event?.kind === "model_retry") return true;
 	if (event?.kind === "live_agent") return !isFailedAgentEvent(event);
 	if (isUserInteractionEvent(event)) return true;
@@ -39,7 +39,7 @@ export function shouldRenderAssistantDivider(entries = [], index = 0) {
 export function conversationTimelineEntries(events = [], primaryToolNameForEvent = () => "", isAgentEventForEvent = () => false) {
 	return (Array.isArray(events) ? events : [])
 		.flatMap((event, index) => {
-			if (event?.kind !== 'answer' || !String(event.message?.reasoning || '').trim()) return [{event, index}];
+			if (event?.kind !== 'answer' || !answerHasReasoning(event)) return [{event, index}];
 			const reasoning = {event, index, part: 'reasoning'};
 			return String(event.message?.content || '').trim() ? [reasoning, {event, index, part: 'answer'}] : [reasoning];
 		})

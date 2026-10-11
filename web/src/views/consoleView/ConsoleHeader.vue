@@ -32,7 +32,7 @@ const durationParts = computed(() => headerDurationParts(props.durationMs));
 		<div class="header-identity min-w-0 flex flex-1 items-center gap-3 overflow-hidden">
 			<div class="header-title-stack min-w-0 flex-1 overflow-hidden leading-tight">
 				<div class="header-subtitle truncate" :title="pathText" :aria-label="`所在目录 ${pathText}`">{{ pathText }}</div>
-				<div class="flex min-w-0 items-center gap-2">
+				<div class="header-title-row flex min-w-0 items-center gap-2">
 					<h1 class="header-title block max-w-full truncate" :title="props.title">
 						<AnimatedConversationTitle :text="props.title" :identity="props.titleIdentity" />
 					</h1>
@@ -41,6 +41,7 @@ const durationParts = computed(() => headerDurationParts(props.durationMs));
 						<template #dropdown><el-dropdown-menu><el-dropdown-item command="properties">会话属性</el-dropdown-item></el-dropdown-menu></template>
 					</el-dropdown>
 				</div>
+				<span v-if="props.running" class="header-mobile-running" role="status" aria-label="运行中" title="运行中"><i aria-hidden="true"></i></span>
 			</div>
 		</div>
 		<dl class="header-metrics" aria-label="会话运行及累计统计">
@@ -72,7 +73,7 @@ const durationParts = computed(() => headerDurationParts(props.durationMs));
 				<dd><span class="header-number">{{ props.costText }}</span></dd>
 			</div>
 		</dl>
-		<span v-if="props.running" class="header-mobile-running" role="status" aria-label="运行中"><i aria-hidden="true"></i><span>运行中</span></span>
+		<div class="header-mobile-recommendations"><slot name="mobile-recommendations"/></div>
 		<div class="header-mobile-actions"><slot name="mobile-actions"/></div>
 	</header>
 </template>
@@ -81,12 +82,15 @@ const durationParts = computed(() => headerDurationParts(props.durationMs));
 .header-properties-menu {display:grid;place-items:center;min-width:28px;min-height:28px;border:0;border-radius:6px;background:transparent;color:var(--ob-chat-muted);}
 .header-properties-menu:hover {background:var(--ob-hover);}
 .header-properties-menu:focus-visible {outline:2px solid var(--ob-focus);}
-@media(max-width:760px){.header-properties-menu {min-width:44px;min-height:44px;}}
 .header-mobile-navigation,
+.header-mobile-recommendations,
 .header-mobile-actions,
 .header-mobile-running { display: none; }
 
 .console-header {
+	position: relative;
+	z-index: 26;
+	isolation: isolate;
 	display: flex;
 	min-height: 66px;
 	flex-shrink: 0;
@@ -94,9 +98,22 @@ const durationParts = computed(() => headerDurationParts(props.durationMs));
 	justify-content: space-between;
 	gap: 28px;
 	border-bottom: 1px solid var(--ob-chat-line);
-	background: var(--ob-chat-bg);
+	background: transparent;
 	color: var(--ob-chat-text);
 	padding: 12px 25px;
+}
+
+.console-header::before {
+	content: '';
+	position: absolute;
+	inset: 0 0 -18px;
+	z-index: -1;
+	pointer-events: none;
+	background: rgb(var(--ob-surface-rgb) / .55);
+	-webkit-backdrop-filter: blur(24px) saturate(1.12);
+	backdrop-filter: blur(24px) saturate(1.12);
+	-webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent);
+	mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent);
 }
 
 .header-subtitle {
@@ -182,21 +199,16 @@ const durationParts = computed(() => headerDurationParts(props.durationMs));
 	}
 
 	.header-mobile-navigation { display: flex; flex: 0 0 44px; }
+	.header-mobile-recommendations { display: flex; flex: none; align-items: center; }
+	.header-mobile-recommendations:empty { display: none; }
 	.header-mobile-actions { display: flex; flex: 0 0 88px; }
-	.header-subtitle { display: block; font-size: 10px; line-height: 17px; }
+	.header-title-stack { position: relative; padding-right: 12px; }
+	.header-subtitle { display: none; }
+	.header-title-row { flex: 1; overflow: hidden; }
 	.header-title { margin-top: 0; }
-	/* Keep the title row at its original 20px, without shrinking the menu hit area. */
-	.header-identity, .header-title-stack { overflow: visible; }
-	.header-properties-dropdown { position: relative; flex: 0 0 44px; width: 44px; height: 20px; }
-	.header-properties-menu { position: absolute; top: 50%; left: 0; width: 44px; height: 44px; transform: translateY(-50%); }
-	.header-mobile-running { display: inline-flex; flex: none; align-items: center; gap: 5px; height: 22px; padding: 0 7px; border: 1px solid rgb(var(--ob-success-rgb) / 0.18); border-radius: 7px; background: rgb(var(--ob-success-rgb) / 0.09); color: var(--ob-success); font-size: 11px; font-weight: 500; line-height: 1; white-space: nowrap; }
+	.header-properties-dropdown { display: none; }
+	.header-mobile-running { display: inline-flex; position: absolute; right: 0; top: 50%; transform: translateY(-50%); width: 6px; height: 6px; color: var(--ob-success); }
 	.header-mobile-running i { width: 6px; height: 6px; flex: none; border-radius: 50%; background: currentColor; }
 	.header-metrics { display: none; }
-}
-</style>
-
-<style>
-@media (max-width: 760px) {
-	html.dark .header-mobile-running { border-color: rgb(var(--ob-success-rgb) / 0.2); }
 }
 </style>

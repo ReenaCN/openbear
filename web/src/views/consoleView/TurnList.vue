@@ -13,6 +13,7 @@ import {
 import ConsoleMarkdown from "./ConsoleMarkdown.vue";
 import WebhookMessageCard from './WebhookMessageCard.vue';
 import CronMessageCard from './CronMessageCard.vue';
+import RecommendationMessageCard from './RecommendationMessageCard.vue';
 import ReplyMarkdownShare from "./ReplyMarkdownShare.vue";
 import {replyMarkdownText} from "./replyMarkdownShare.js";
 import TurnEvent from "./TurnEvent.vue";
@@ -318,11 +319,12 @@ async function copyMessage(content, key) {
 <template>
 	<template v-for="(turn, turnIndex) in props.turns" :key="turn.id">
 	<section v-if="(turn.user && !turn.user.syntheticPlaceholder && !visibility.isHidden(turn.user)) || hasAssistantContent(turn) || assistantMetaVisible(turn, turnIndex)" class="turn-block" :data-turn-index="turnIndex">
-		<div v-if="turn.user && !turn.user.syntheticPlaceholder && !visibility.isHidden(turn.user)" class="timed-row timed-row-user visibility-hover-surface" :data-search-op-id="turn.user.opId || turn.user.id" :class="[visibilitySelectionClasses(turn.user, visibility), {'timed-row-event': ['webhook', 'cron'].includes(turn.user.source)}]" @click.capture="selectVisibilityRow($event, turn.user, visibility)">
+		<div v-if="turn.user && !turn.user.syntheticPlaceholder && !visibility.isHidden(turn.user)" class="timed-row timed-row-user visibility-hover-surface" :data-search-op-id="turn.user.opId || turn.user.id" :class="[visibilitySelectionClasses(turn.user, visibility), {'timed-row-event': ['webhook', 'cron', 'recommendation'].includes(turn.user.source)}]" @click.capture="selectVisibilityRow($event, turn.user, visibility)">
 			<div class="user-row">
 				<div class="user-message-group">
 					<WebhookMessageCard v-if="turn.user.source === 'webhook'" :message="turn.user"/>
 					<CronMessageCard v-else-if="turn.user.source === 'cron'" :message="turn.user"/>
+					<RecommendationMessageCard v-else-if="turn.user.source === 'recommendation'" :message="turn.user"/>
 					<article v-else class="message-user">
 						<ConsoleMarkdown v-if="turn.user.content" :text="turn.user.content" :reference-bundle-id="turn.user.referenceBundleId || ''" :references="turn.user.references || []"/>
 						<div v-if="userAttachments(turn).length" class="user-attachments" :class="{ 'with-text': turn.user.content }">
@@ -343,7 +345,7 @@ async function copyMessage(content, key) {
 						</template>
 					</div>
 				</article>
-				<div v-if="!['webhook', 'cron'].includes(turn.user.source)" class="user-message-meta">
+				<div v-if="!['webhook', 'cron', 'recommendation'].includes(turn.user.source)" class="user-message-meta">
 					<MessageVisibilityAction :target="turn.user" desktop-placement="footer" :turn="turn" mobile-selection-only/>
 					<el-tooltip v-if="turn.user.content" content="复制消息" placement="bottom" :show-after="350">
 						<button type="button" class="message-icon-action" aria-label="复制消息"
@@ -704,14 +706,14 @@ async function copyMessage(content, key) {
 
 @media (max-width: 760px) {
 	.message-hide-action { display: inline-grid; width: 32px; height: 32px; flex-basis: 32px; }
-	.assistant-message-meta { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; white-space: normal; }
-	.assistant-meta-details { display: flex; min-width: 0; flex-direction: column; gap: 3px; line-height: 1.45; }
+	.assistant-message-meta { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; gap: 2px; white-space: normal; }
+	.assistant-meta-details { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 3px 8px; line-height: 1.45; }
 	.assistant-message-time { white-space: nowrap; }
 	.assistant-meta-separator, .footer-token-arrow, .footer-metric-separator { display: none; }
 	.footer-metric { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; vertical-align: middle; }
 	.footer-meta-icon { display: block; width: 11px; height: 11px; flex: 0 0 11px; opacity: .8; }
-	.turn-token-usage { display: flex; flex-wrap: wrap; gap: 3px 8px; }
-	.message-footer-actions { flex-wrap: nowrap; align-self: center; gap: 4px; }
+	.turn-token-usage { display: contents; }
+	.message-footer-actions { flex-wrap: nowrap; justify-self: start; align-self: start; gap: 4px; }
 	.message-footer-actions .message-icon-action { width: 32px; height: 32px; flex-basis: 32px; }
 	/* Identify the menu's target without changing its width or flow. */
 	.visibility-menu-target { border-radius: 10px; background: rgb(var(--ob-surface-soft-rgb) / 0.08); box-shadow: 0 0 0 1px rgb(var(--ob-shadow-rgb) / 0.14); }

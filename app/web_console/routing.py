@@ -60,6 +60,8 @@ class WebAdminAppMixin:
         install_webhooks(app, self)
         from app.cron.http import install as install_cron
         install_cron(app, self)
+        from app.recommendations.http import install as install_recommendations
+        install_recommendations(app, self)
         app.cleanup_ctx.append(self._realtime_context)
         app.cleanup_ctx.append(self._web_push_context)
         app.on_shutdown.append(self._realtime_shutdown)
@@ -76,6 +78,7 @@ class WebAdminAppMixin:
             web.get("/statistics", self.handle_index),
             web.get("/webhooks", self.handle_index),
             web.get("/cron", self.handle_index),
+            web.get("/recommendations", self.handle_index),
             web.get("/assets/{path:.*}", self.handle_asset),
             *(web.get(path, self.handle_pwa_asset) for path in PWA_PUBLIC_FILES),
             web.post("/api/auth/login/start", self.handle_login_post),

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from app.interaction_data import explicit_authorization
@@ -73,6 +74,8 @@ async def _confirm_if_needed(
     reason: str,
     body: str,
     confirm_text: str,
+    target: str = "current_run",
+    approval_constraints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     del svc
     ctx = current_tool_context()
@@ -81,6 +84,8 @@ async def _confirm_if_needed(
     result = await ctx.web_confirm({
         "_sourceTool": "OpenBearControl",
         "_requiresAuthorization": True,
+        "_approvalScope": {"contract": "openbear-control-v1", "action": action, "target": target},
+        "_approvalConstraints": approval_constraints or {},
         "title": f"确认执行：{action}",
         "body": body + (f"\n\n原因：{reason}" if reason else ""),
         "type": "warning" if action in {"restart", "new", "stop"} else "info",
@@ -309,6 +314,12 @@ async def _action_think(svc: Any, chat_id: int, args: dict[str, Any]) -> str:
 
 
 async def _action_restart(svc: Any, chat_id: int, args: dict[str, Any], reason: str) -> str:
+    try:
+        delay_s = float(args.get("delayS") or args.get("delay_s") or 1.0)
+        if not math.isfinite(delay_s) or delay_s < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return _json({"status": "error", "action": "restart", "error": "invalid_delay"})
     confirm = await _confirm_if_needed(
         svc,
         action="restart",
@@ -320,13 +331,14 @@ async def _action_restart(svc: Any, chat_id: int, args: dict[str, Any], reason: 
             f"子进程：{processes.count()}"
         ),
         confirm_text="确认重启",
+        approval_constraints={"minimums": {"delayS": delay_s}},
     )
     if not explicit_authorization(confirm):
         return _json({"status": "cancelled", "action": "restart", "confirmation": confirm})
     svc.control_actions.enqueue_after_turn(
         chat_id,
         "restart",
-        {"delayS": float(args.get("delayS") or args.get("delay_s") or 1.0)},
+        {"delayS": delay_s},
         reason=reason,
         requested_by="OpenBearControl",
     )
@@ -369,6 +381,7 @@ async def _action_stop(svc: Any, chat_id: int, args: dict[str, Any], reason: str
         reason=reason,
         body=f"这会停止目标：{target}。当前回复会尽量优雅收尾。",
         confirm_text="确认停止",
+        target=target,
     )
     if not explicit_authorization(confirm):
         return _json({"status": "cancelled", "action": "stop", "target": target, "confirmation": confirm})
@@ -433,8 +446,8 @@ def register_openbear_control_tool(reg: ToolRegistry, svc: Any) -> None:
             "OpenBear control plane: status/models/mcp_status/skills_status/skills_reload/mcp_reload/think/restart/new/foreground-run stop. "
             "Do not use this tool for Rath/Agent task cancellation; use AgentStop. "
             "Risky actions provide their own required channel confirmation; for an already requested action, call this tool directly without a redundant UserInteraction pre-confirmation. Never bypass its gate. "
-            "Actions run safely after the reply when needed. Confirmation text is feedback, not authorization: read confirmation.text, preserve the user's conditions, and obtain a new confirmation only if a revised action is still requested and requires it. Cancellation or timeout never authorizes execution; "
-            "do not restart/stop openbear.service via Bash."
+            "Actions run safely after the reply when needed. decision=feedback is not authorization. On amendments_required the user has approved the amended action: read all confirmation.text, apply it, then resubmit with _openbearApprovalId=approvalId without asking again within that scope. Cancellation or timeout never authorizes execution; "
+            "do not restart/stop openbear.service via Bash. Receipts keep the action and target fixed; restart delay may increase, not advance execution."
         ),
         {
             "type": "object",

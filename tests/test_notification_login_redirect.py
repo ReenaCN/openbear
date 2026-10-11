@@ -1,3 +1,7 @@
+import json
+import shutil
+import subprocess
+from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
@@ -10,6 +14,8 @@ from tests.test_login_update_regressions import login_env as login_env
 @pytest.mark.parametrize("target", [
     "/chat?id=a%26b%2F%E4%BC%9A%E8%AF%9D",
     "/settings?section=system-settings&domain=notifications",
+    "/recommendations",
+    "/recommendations?source=push&label=%E6%8E%A8%E8%8D%90",
 ])
 async def test_notification_page_target_survives_unauthenticated_login_chain(login_env, target):
     env = login_env
@@ -44,10 +50,10 @@ async def test_notification_page_target_survives_unauthenticated_login_chain(log
     assert parse_qs(restored.url.raw_query_string) == parse_qs(urlsplit(target).query)
 
 
-async def test_notification_return_target_survives_configured_https_login_hop(login_env):
+@pytest.mark.parametrize("target", ["/chat?id=a%26b", "/recommendations?source=push"])
+async def test_notification_return_target_survives_configured_https_login_hop(login_env, target):
     env = login_env
     env.server.config.web.custom_url = "https://console.example:8443"
-    target = "/chat?id=a%26b"
     response = await env.client.get(target, allow_redirects=False)
     assert response.status == 302
     response = await env.client.get(response.headers["Location"], headers={"Host": "untrusted.invalid"}, allow_redirects=False)
@@ -62,6 +68,9 @@ async def test_notification_return_target_survives_configured_https_login_hop(lo
     "https://evil.test/chat", "//evil.test/chat", "/\\evil.test/chat", "/chat\n?x=1",
     "/chat\t", "/api/auth/session", "/login?next=/chat", "/memory", "/%2f%2fevil.test/chat",
     "%2Fchat", "https://console.example/chat", "chat?id=x", "/chat/../settings",
+    "https://evil.test/recommendations", "//evil.test/recommendations",
+    "/\\evil.test/recommendations", "/recommendations/", "/recommendations-extra",
+    "/api/recommendations/cards", "/%72ecommendations", "/recommendations\n?source=push",
 ])
 async def test_https_login_rejects_non_whitelisted_return_targets(login_env, target):
     env = login_env
@@ -70,6 +79,40 @@ async def test_https_login_rejects_non_whitelisted_return_targets(login_env, tar
     assert response.status == 302
     assert response.headers["Location"] == "https://console.example/login"
     assert _notification_return_target(target) == ""
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="cross-language worker/login regression requires Node")
+async def test_real_recommendation_payload_worker_and_server_login_round_trip(login_env):
+    from app.web_push import BrowserPush
+
+    root = Path(__file__).resolve().parents[1]
+    payload = BrowserPush.payload("recommendation", "process-conversation", "recommendation-update")
+    # Run the actual worker handlers with browser notification/client seams only.
+    worker = subprocess.run(["node", "--input-type=module", "-e", """
+        import fs from 'node:fs'; import vm from 'node:vm';
+        const handlers = {}, notices = [], opened = [];
+        const self = {location: {origin: 'https://bear.test'},
+          addEventListener: (type, handler) => handlers[type] = handler,
+          registration: {showNotification: async (title, options) => notices.push(options)},
+          clients: {matchAll: async () => [], openWindow: async url => opened.push(url)}};
+        vm.runInNewContext(fs.readFileSync('web/public/openbear-push-sw.js', 'utf8'), {self, URL});
+        let pending;
+        handlers.push({data: {json: () => JSON.parse(fs.readFileSync(0, 'utf8'))}, waitUntil: p => pending = p});
+        await pending;
+        handlers.notificationclick({notification: {close() {}, data: notices[0].data}, waitUntil: p => pending = p});
+        await pending; console.log(JSON.stringify(opened));
+    """], cwd=root, input=json.dumps(payload), text=True, capture_output=True, check=True, timeout=15)
+    clicked = json.loads(worker.stdout)
+    assert clicked == ["https://bear.test/recommendations"]
+    page = await login_env.client.get(urlsplit(clicked[0]).path, allow_redirects=False)
+    assert page.status == 302
+    login_url = page.headers["Location"]
+    # The browser's success handler consumes exactly the server-generated next.
+    success = subprocess.run(["node", "--input-type=module", "-e", """
+        import fs from 'node:fs'; import {loginSuccessTarget} from './web/src/loginRedirect.js';
+        console.log(loginSuccessTarget(new URL(fs.readFileSync(0, 'utf8'), 'https://bear.test')));
+    """], cwd=root, input=login_url, text=True, capture_output=True, check=True, timeout=15)
+    assert success.stdout.strip() == "/recommendations"
 
 
 async def test_non_notification_pages_keep_existing_login_destination(login_env):

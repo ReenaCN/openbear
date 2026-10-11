@@ -59,3 +59,11 @@ test('preview metadata is not serialized into drag/copy/draft reference identifi
   assert.deepEqual(normalizeReference(ref),{kind:'secret',id:'17',label:'环境凭证',scope:'full'});
   assert.equal(referenceToken(ref),'[环境凭证](openbear://ref/secret/17)');
 });
+
+test('rec/ prefix scopes completion to recommendation cards',()=>{
+ assert.deepEqual((({query,kind})=>({query,kind}))(mentionAtPosition(position('看下 @rec/模型'))),{query:'模型',kind:'rec'});
+});
+test('recommendation candidates show category and excerpt',()=>{
+ assert.equal(referenceCandidateDetail({kind:'rec',category:'news',preview:'一段摘要'}),'新闻 · 一段摘要');
+ assert.equal(referenceCandidateDetail({kind:'rec'}),'推荐');
+});

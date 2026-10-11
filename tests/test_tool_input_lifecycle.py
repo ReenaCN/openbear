@@ -170,7 +170,10 @@ async def test_retry_uses_new_display_segment_without_replaying_old_snapshot(pre
 @pytest.mark.parametrize('with_reasoning', [False, True])
 async def test_timing_counts_parameter_bytes_and_excludes_parameter_generation(monkeypatch, with_reasoning):
     clock = [100.0]
-    monkeypatch.setattr(model_call, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    wall_time = 1_800_000_000.0
+    # Replace only model_call's clock view, not asyncio's monotonic clock.
+    # Wall-clock request identity is independent of elapsed-time measurements.
+    monkeypatch.setattr(model_call, 'time', SimpleNamespace(monotonic=lambda: clock[0], time=lambda: wall_time))
 
     class Backend:
         async def stream(self, *args, **kwargs):
@@ -187,6 +190,7 @@ async def test_timing_counts_parameter_bytes_and_excludes_parameter_generation(m
             yield StreamEvent('finish', finish_reason='tool_calls')
 
     result = await execute_attempt(PreparedRequest(Backend(), [], {'model': 'fixture'}))
+    assert result.started_at_ms == int(wall_time * 1000)
     assert result.first_token_ms == (1000 if with_reasoning else 2000)
     assert result.reasoning_ms == (500 if with_reasoning else 0)
     assert result.total_time_ms == 62000
@@ -194,7 +198,10 @@ async def test_timing_counts_parameter_bytes_and_excludes_parameter_generation(m
 
 async def test_timing_sums_separate_reasoning_phases_without_intervening_output(monkeypatch):
     clock = [100.0]
-    monkeypatch.setattr(model_call, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    wall_time = 1_800_000_000.0
+    # Replace only model_call's clock view, not asyncio's monotonic clock.
+    # Wall-clock request identity is independent of elapsed-time measurements.
+    monkeypatch.setattr(model_call, 'time', SimpleNamespace(monotonic=lambda: clock[0], time=lambda: wall_time))
 
     class Backend:
         async def stream(self, *args, **kwargs):
@@ -207,6 +214,7 @@ async def test_timing_sums_separate_reasoning_phases_without_intervening_output(
                 yield event
 
     result = await execute_attempt(PreparedRequest(Backend(), [], {'model': 'fixture'}))
+    assert result.started_at_ms == int(wall_time * 1000)
     assert result.reasoning_ms == 3000
     assert result.total_time_ms == 100000
 

@@ -377,6 +377,29 @@ class ContextManagementConfig(BaseModel):
     model_config = {"populate_by_name": True, "extra": "forbid"}
 
 
+class ProgressReminderConfig(BaseModel):
+    """无推进提醒：长时间只在思考和读取时，下一次请求前提醒模型；不打断、不改档位。"""
+    enabled: bool = True
+    minutes: float = Field(default=15.0, ge=1.0, le=1440.0)
+    # 与用户消息尾部模板一致：默认值就是内置正文，设置页打开即可编辑；运行时空值仍回退内置模板。
+    controller_prompt: str = Field(default_factory=lambda: _progress_prompt("controller"), alias="controllerPrompt")
+    agent_prompt: str = Field(default_factory=lambda: _progress_prompt("agent"), alias="agentPrompt")
+
+    model_config = {"populate_by_name": True, "extra": "forbid"}
+
+    @field_validator("controller_prompt", "agent_prompt")
+    @classmethod
+    def _validate_prompt(cls, value: str) -> str:
+        from app.agent.progress_watch import validate_notice_template
+        validate_notice_template(value)
+        return value
+
+
+def _progress_prompt(kind: str) -> str:
+    from app.agent.progress_watch import DEFAULT_AGENT_PROMPT, DEFAULT_CONTROLLER_PROMPT
+    return DEFAULT_AGENT_PROMPT if kind == "agent" else DEFAULT_CONTROLLER_PROMPT
+
+
 class AgentConfig(BaseModel):
     @model_validator(mode="before")
     @classmethod
@@ -405,6 +428,7 @@ class AgentConfig(BaseModel):
 
     max_run_wall_seconds: float = Field(default=0.0, alias="maxRunWallSeconds")
     no_progress_rounds: int = Field(default=8, alias="noProgressRounds")
+    progress_reminder: ProgressReminderConfig = Field(default_factory=ProgressReminderConfig, alias="progressReminder")
     compact_ratio: float = Field(default=0.7, alias="compactRatio", gt=0, lt=1)
     keep_recent_messages: int = Field(default=8, alias="keepRecentMessages", ge=0)
     compact_prompt: str = Field(default="", alias="compactPrompt")

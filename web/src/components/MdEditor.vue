@@ -73,6 +73,10 @@ const TEMPLATE_EXPRESSIONS = [
   { expr: "conversation.folderPath", detail: "当前会话目录路径" },
   // 当前 build_system_prompt_params() 提供的运行时变量
   { expr: "workspaceDir", detail: "OpenBear 公共 workspace（工具与产物根保持不变）" },
+  { expr: "loop.minutes", detail: "无推进提醒：已多少分钟没有推进" },
+  { expr: "loop.reads", detail: "无推进提醒：期间读取、查询次数" },
+  { expr: "loop.thinkSteps", detail: "无推进提醒：期间思考步数" },
+  { expr: "loop.count", detail: "无推进提醒：本轮第几次提醒" },
   { expr: "folderWorkspaceDir", detail: "当前主会话目录继承后的工作目录；无设置时回退 workspaceDir" },
   { expr: "folderPrompt", detail: "当前主会话目录继承后的 Markdown 提示词（就近覆盖）" },
   { expr: "toolNames", detail: "当前全部可用工具名列表(内置 + MCP)" },

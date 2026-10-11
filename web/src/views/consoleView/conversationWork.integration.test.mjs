@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import {register} from 'node:module';
 import {compileScript, compileStyle, compileTemplate, parse} from '@vue/compiler-sfc';
-import {createRenderer, h, nextTick, reactive, ref, shallowRef} from 'vue';
+import {createRenderer, h, nextTick, reactive, ref, shallowRef, toRaw} from 'vue';
 import {conversationTimelineEntries} from './conversationTimeline.js';
 import {createTimelineReuse} from './timelineReuse.js';
 import {deriveOperationRunState, projectOperationMessages, reduceOperationFrame, withTransientIdleThinking} from '../../timelineProjection.js';
@@ -41,6 +41,9 @@ const node = (type, text = '') => ({type, text, props: {}, children: [], parent:
   get textContent() {return this.text;}, set textContent(value) {this.text=value;this.children=[];},
   get scrollWidth() {return Array.from(this.text).length * 10;}, clientWidth: 200, scrollLeft: 0,
   listeners: new Map(), addEventListener(name, fn) {this.listeners.set(name, fn);}, removeEventListener(name) {this.listeners.delete(name);}, classList: {add() {}, remove() {}}, dataset: {},
+  closest(selector) { let n=this; while(n) {if(selector.startsWith('.')&&String(n.props.class||'').split(/\s+/).includes(selector.slice(1)))return n;n=n.parent;}return null; },
+  getBoundingClientRect() { return {top:0,bottom:this.layoutHeight??this.scrollHeight,height:this.layoutHeight??this.scrollHeight}; },
+  focus(options) { this.focusOptions=options; },
   contains(n) { return n === this || this.children.some(c => c.contains(n)); }});
 const renderer = createRenderer({
   createElement: t => node(t), createText: t => node('#text', t), createComment: t => node('#comment', t),
@@ -685,6 +688,36 @@ test('disclosure keeps content through the height/fade animation, restores readi
   unmount.forEach(f=>f()); complete(); await Promise.resolve();
   assert.equal(done,2,'a cancelled/unmounted animation must not finish a replacement transition');
   assert.equal(callbacks.size,0);
+});
+
+test('long tool disclosures expose a bottom close action, return focus and release size observers', async t => {
+  const original=globalThis.ResizeObserver, observers=[];
+  globalThis.ResizeObserver=class { constructor(callback){this.callback=callback;this.targets=[];this.disconnected=false;observers.push(this);} observe(el){this.targets.push(el);} disconnect(){this.disconnected=true;} };
+  t.after(()=>{globalThis.ResizeObserver=original;});
+  let revealed;
+  const root=mount(t,'ConversationProcessEvent.vue',{event:tool()},null,[[WORK_MOTION,{reveal:el=>{revealed=el;}}]]);
+  root.props.class='console-scroll';root.clientHeight=500;
+  assert.equal(find(root,'process-collapse-button'),undefined);
+  const summary=find(root,'process-summary');summary.props.onClick();await nextTick();await nextTick();
+  const content=find(root,'process-tool-content'), observer=observers.find(o=>o.targets.some(el=>toRaw(el)===content));
+  assert.ok(observer);assert.ok(observer.targets.some(el=>toRaw(el)===root));
+  assert.ok(find(root,'process-collapse-button'));
+  content.layoutHeight=100;observer.callback();await nextTick();assert.equal(find(root,'process-collapse-button'),undefined);
+  content.layoutHeight=290;observer.callback();await nextTick();assert.equal(find(root,'process-collapse-button'),undefined);
+  root.clientHeight=300;observer.callback();await nextTick();assert.ok(find(root,'process-collapse-button'),'keyboard-sized viewport makes tall content collapsible');
+  find(root,'process-collapse-button').props.onClick({stopPropagation(){}});await nextTick();await nextTick();
+  assert.equal(summary.props['aria-expanded'],false);assert.equal(toRaw(revealed),summary);
+  assert.deepEqual(summary.focusOptions,{preventScroll:true});assert.equal(find(root,'process-tool-content'),undefined);
+  assert.equal(observer.disconnected,true);
+});
+
+test('group bottom close folds the whole disclosure, not just one nested tool', async t => {
+  const root=mount(t,'ConversationProcessEvent.vue',{event:{kind:'tool_group',events:[tool('one'),tool('two')]}});
+  find(root,'process-summary').props.onClick();await nextTick();await nextTick();
+  assert.equal(walk(root).filter(n=>hasClass(n,'tool-event')).length,2);
+  find(root,'process-collapse-button').props.onClick({stopPropagation(){}});await nextTick();await nextTick();
+  assert.equal(walk(root).filter(n=>hasClass(n,'tool-event')).length,0);
+  assert.equal(find(root,'process-summary').props['aria-expanded'],false);
 });
 
 test('small phone toolbar reserves separate tracks rather than hiding controls; reduced-motion and shared theme roles remain', () => {

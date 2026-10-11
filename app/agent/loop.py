@@ -20,6 +20,7 @@ from typing import Any, Protocol
 
 from app.agent.context_overflow import is_request_size_error
 from app.agent.native_continuation import native_items_for_tool_calls
+from app.agent.progress_watch import ProgressWatch
 from app.agent.result import RunResult
 from app.runtime.engine import ExecutionRuntime, RuntimeDecision, ToolBatch
 from app.runtime.model_call import ModelCallDriver, PreparedRequest
@@ -250,6 +251,18 @@ def _calls_signature(calls: list[ToolCall]) -> str:
     return "|".join(f"{c.name}:{c.arguments}" for c in calls)
 
 
+def _repeat_call_notice(rounds: int) -> str:
+    return (
+        "<repeat-call-notice internal=\"true\">\n"
+        "运行时提醒（自动发出，不是用户消息）：\n"
+        f"你已经连续 {rounds} 次发出完全相同的工具调用，期间没有任何说明。\n"
+        "如果是在等后台任务完成：用一句话说明在等什么、大概还要多久，然后继续等。\n"
+        "如果不是：同样的调用不会得到新结果，换一种做法。\n"
+        f"不加说明再重复 {rounds} 次，本轮会被中止。\n"
+        "</repeat-call-notice>"
+    )
+
+
 def _assistant_message(
     *,
     content: str,
@@ -292,8 +305,11 @@ class Agent:
                  retry_jitter_ratio: float = 0.0,
                  max_overflow_retries: int = 3,
                  empty_response_retry_limit: int = 1,
-                 reasoning_only_retry_limit: int = 2) -> None:
+                 reasoning_only_retry_limit: int = 2,
+                 progress_watch: ProgressWatch | None = None) -> None:
         self._backend = backend
+        # 无推进提醒：只在下一次模型请求前追加提醒，不打断、不改档位。
+        self._progress_watch = progress_watch
         self._tools = tools
         self._max_wall = max_run_wall_seconds
         self._no_progress = no_progress_rounds
@@ -358,12 +374,16 @@ class Agent:
             except Exception:
                 pass
         convo = list(messages)
+        progress_watch = self._progress_watch
+        if progress_watch is not None:
+            progress_watch.reset()
         controller_seen_high_water: int | None = None
         injected_command_ids: set[str] = set()
         tool_schemas = self._tools.schemas(scope="main")
         t0 = time.monotonic()
         result.start_monotonic = t0  # 供取消兜底现算 total_time_ms
         repeat_sigs: list[str] = []
+        repeat_notices: list[str] = []
         agent_terminal_snapshot_consumed = False
         async_agent_tool_result_seen = False
         agent_wait_reminder_sent = False
@@ -630,12 +650,51 @@ class Agent:
                         await save_user(content=steer_text)
             injected_command_ids.update(cid for cid in command_ids if cid)
             result.steered += len([item for item in steers if _steer_text(item)])
+            if progress_watch is not None:
+                progress_watch.on_user_input()
             return True
 
         def _drain_steers() -> list[str]:
             if steer_drain is None:
                 return []
             return steer_drain()
+
+        async def _inject_progress_notice() -> None:
+            """无推进超时：在末尾追加一条运行时提醒（不改已缓存前缀），并在时间线留一条提示。"""
+            nonlocal open_rendered
+            if progress_watch is None or round_no == 0:
+                return
+            notice = progress_watch.take_notice()
+            if not notice:
+                return
+            log.warning("长时间无推进，已提醒模型", 次数=progress_watch.count)
+            # 与 AgentWait 提醒相同：只进上下文（归档供窗口轮换保留），不写成用户消息、不计用户轮次。
+            convo.append({"role": "user", "content": notice,
+                          "openbear_context_source": {"kind": "control", "id": uuid.uuid4().hex,
+                                                      "control": "progress_reminder"}})
+            await _archive_context(convo)
+            runtime_notice = getattr(renderer, "on_runtime_notice", None)
+            if callable(runtime_notice):
+                maybe = runtime_notice(f"已 {int(progress_watch.threshold_s // 60)} 分钟以上没有推进，已提醒模型重新审视状态（第 {progress_watch.count} 次）")
+                if inspect.isawaitable(maybe):
+                    await maybe
+
+        async def _inject_repeat_notice() -> None:
+            """连续相同调用：在末尾追加一次提醒；模型说明在等什么即可继续。"""
+            if not repeat_notices:
+                return
+            notice = repeat_notices.pop()
+            repeat_notices.clear()
+            log.warning("连续相同工具调用，已提醒模型", 轮次=round_no)
+            convo.append({"role": "user", "content": notice,
+                          "openbear_context_source": {"kind": "control", "id": uuid.uuid4().hex,
+                                                      "control": "repeat_call_reminder"}})
+            await _archive_context(convo)
+            runtime_notice = getattr(renderer, "on_runtime_notice", None)
+            if callable(runtime_notice):
+                maybe = runtime_notice(f"连续 {self._no_progress} 次完全相同的工具调用，已提醒模型；不加说明再重复 {self._no_progress} 次将中止")
+                if inspect.isawaitable(maybe):
+                    await maybe
 
         # Adapter state is shared by named execution boundaries; only the
         # ExecutionRuntime owns model/tool advancement.
@@ -662,6 +721,8 @@ class Agent:
                 # 轮间注入：取出运行中排队的插话消息，作为 user 消息插入会话。
                 # 放在每轮请求模型之前，模型下一轮即可见老大的补充指导/改目标。
                 await _inject_steers(_drain_steers(), cut=open_rendered)
+                await _inject_progress_notice()
+                await _inject_repeat_notice()
 
                 if tool_context is not None and tool_context.receipt_repair:
                     if not tool_context.receipt_repair_started:
@@ -672,6 +733,8 @@ class Agent:
                     tool_context.receipt_repair_calls += 1
                 round_no += 1
                 result.rounds = round_no
+                if progress_watch is not None:
+                    progress_watch.on_model_step()
                 await renderer.on_status("正在思考 …")
 
             async def call_model(host_self):
@@ -793,6 +856,9 @@ class Agent:
                         result.last_usage = usage
                     if outcome.status == "ok":
                         result.model_ok += 1
+                        result.connect_samples += int(outcome.connect_ms > 0)
+                        result.first_token_samples += int(outcome.first_token_ms > 0)
+                        result.call_time_samples += int(outcome.total_time_ms > 0)
                         result.connect_ms_sum += outcome.connect_ms
                         result.first_token_ms_sum += outcome.first_token_ms
                         result.call_time_ms_sum += outcome.total_time_ms
@@ -823,6 +889,8 @@ class Agent:
                         await session.acknowledge_commands(outcome.request.metadata.get("controlIds", []))
 
                 async def retry_state(state):
+                    if progress_watch is not None:
+                        progress_watch.on_retry_wait(bool(state.get("active")))
                     await session.phase("retry_wait" if state.get("active") else "model", waiting=bool(state.get("active")))
                     state = {**state, "callRound": round_no}
                     hook = getattr(renderer, "on_retry_state", None)
@@ -940,11 +1008,16 @@ class Agent:
                     native_output_items=list(assistant_message.get("native_output_items") or []),
                 )
                 await _archive_context(convo)
-                # 无进展打转检测
+                # 无进展打转检测：连续 N 次完全相同、不带正文的调用先提醒（如分段等待后台任务），
+                # 继续重复到 2N 次才中止。
                 sig = _calls_signature(pending)
                 if not full_text.strip():
+                    if repeat_sigs and repeat_sigs[-1] != sig:
+                        repeat_sigs.clear()
                     repeat_sigs.append(sig)
-                    if len(repeat_sigs) >= self._no_progress and len(set(repeat_sigs[-self._no_progress:])) == 1:
+                    if len(repeat_sigs) == self._no_progress:
+                        repeat_notices.append(_repeat_call_notice(self._no_progress))
+                    if len(repeat_sigs) >= 2 * self._no_progress:
                         log.warning("检测到工具调用打转，强制收尾", 轮次=round_no)
                         result.halted_reason = "no_progress"
                         result.total_time_ms = int((time.monotonic() - t0) * 1000)
@@ -966,6 +1039,8 @@ class Agent:
             async def execute_tool(host_self, tc):
                 nonlocal convo, round_no, open_rendered, emergency_overflow_tries, empty_retry, reasoning_only_retry, agent_terminal_snapshot_consumed, async_agent_tool_result_seen, agent_wait_reminder_sent, agent_wait_required, last_agent_wait_delay_s, full_text, reasoning_text, signature, pending, finish, produced_any, native_output_items, native_round_replayable, detached_agent_count, delivered_agent_output_tokens, delivered_agent_result_count, batch_tool_images
                 result.tools_used.append(tc.name)
+                if progress_watch is not None:
+                    progress_watch.on_tool(tc.name, tc.arguments)
                 is_interaction = is_user_interaction_tool(tc.name)
                 # 普通工具直接显示调用意图；用户交互工具会弹独立卡片，
                 # 完成后再把干净结果写回主消息，避免聊天里留下两份杂乱信息。
@@ -1073,6 +1148,8 @@ class Agent:
                         context=dispatch_context,
                     )
                 await session.phase("tool_result")
+                if progress_watch is not None:
+                    progress_watch.on_tool_finished(tc.name, tc.arguments)
                 session.tool_outcome = dispatch_context.tool_outcome or ToolOutcome(tool_result, "completed", "not_started")
                 batch_tool_images.extend(session.tool_outcome.images)
                 tool_duration_ms = int((time.monotonic() - tool_t0) * 1000)
@@ -1136,8 +1213,11 @@ class Agent:
                         # Each AgentWait arms exactly one wait. After it wakes,
                         # the model must explicitly choose a fresh wait if scoped
                         # Agents remain; an old review plan never carries forward.
-                        agent_wait_required = remaining > 0
-                        if remaining == 0:
+                        # Reading another recorded page is not a new wait.
+                        # Do not latch away unconsumed control facts at terminal.
+                        review_pending = bool(wait_payload.get("reviewPending"))
+                        agent_wait_required = remaining > 0 or review_pending
+                        if remaining == 0 and not review_pending:
                             # Hard terminal latch for AgentWait only: future waits
                             # in this root turn are hidden no-ops until a new Agent
                             # starts. Ordinary controller tools remain available.

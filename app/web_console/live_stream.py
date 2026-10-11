@@ -818,6 +818,10 @@ class _WebStreamRenderer:
     async def finalize_notice(self, note: str) -> None:
         await self.emit({"type": "notice", "text": note, "footer": self._footer})
 
+    async def on_runtime_notice(self, note: str) -> None:
+        """运行中的框架提示（如无推进提醒）：只在时间线留一条信息，不结束本轮。"""
+        await self.emit({"type": "notice", "text": note, "eventUuid": uuid.uuid4().hex, "runtimeNotice": True})
+
     async def fail(self, error_text: str) -> None:
         await self.emit({"type": "error", "error": error_text})
 

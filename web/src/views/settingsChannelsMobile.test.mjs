@@ -83,7 +83,7 @@ test('settings merges navigation only after its lazy header is ready, preserving
   const scope = Vue.reactive({
     active:'settings', activeView:Vue.markRaw(Forwarder), sidebarOpen:false,
     settingsSection:'channels', pageHeaderReady:false, cronFolderId:'', cronLeaveGuard:null,
-    handleSettingsSectionChanged(){}, openWebhookProperties(){}, selectNav(){},
+    handleSettingsSectionChanged(){}, openWebhookProperties(){}, openRecommendationDraft(){}, selectNav(){},
     handleCronFolderChanged(){}, openCronConversation(){},
   });
   const compiled = Vue.compile(outlet.loc.source.replace(/\s+v-else(?=\s)/, ''));

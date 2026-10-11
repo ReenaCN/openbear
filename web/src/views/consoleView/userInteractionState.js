@@ -66,9 +66,9 @@ export function hasSubmittedInteractionText(value) {
 export function interactionPrimaryActionLabel(item, draft, submitting = false) {
 	if (submitting) return "提交中…";
 	const action = actionOf(item);
-	if (action === "confirm" && hasSubmittedInteractionText(draft?.text)) return "提交意见（不执行原操作）";
+	if (action === "confirm" && hasSubmittedInteractionText(draft?.text)) return "按补充内容确认执行";
 	if (action === "select" && item?.requiresAuthorization && hasSubmittedInteractionText(draft?.text)) {
-		return "提交意见（不执行原操作）";
+		return draft?.selectedIndexes?.length ? "按补充内容确认执行" : "仅提交意见，暂不执行";
 	}
 	if (item?.confirmText) return String(item.confirmText);
 	if (action === "confirm") return "确认执行";
@@ -103,6 +103,8 @@ export function buildInteractionAnswer(item, draft = {}, intent = "submit") {
 			selectedIndexes: [...indexes],
 			selectedValues: indexes.map((index) => interactionOptionValue(options[index])),
 			text: String(draft.text ?? ""),
+			...(item?.requiresAuthorization && hasSubmittedInteractionText(draft.text)
+				? {decision: intent === "feedback" || !indexes.length ? "feedback" : "confirm_with_changes"} : {}),
 		};
 	}
 	if (action === "prompt") {
@@ -111,15 +113,15 @@ export function buildInteractionAnswer(item, draft = {}, intent = "submit") {
 	if (action === "confirm") {
 		const selectedDecision = intent === "reject" ? "reject" : (intent === "feedback" ? "feedback" : "confirm");
 		const originalText = String(draft.text ?? "");
-		// Whitespace is only used to decide emptiness; meaningful original text is
-		// preserved and can never grant authority.
-		const decision = hasSubmittedInteractionText(originalText) ? "feedback" : selectedDecision;
+		// Approval is an explicit button action, never inferred from prose.
+		const decision = selectedDecision === "confirm" && hasSubmittedInteractionText(originalText)
+			? "confirm_with_changes" : selectedDecision;
 		return {
 			cancelled: false,
 			decision,
 			selectedDecision,
 			text: originalText,
-			confirmed: decision === "confirm",
+			confirmed: decision === "confirm" || decision === "confirm_with_changes",
 		};
 	}
 	return {cancelled: false};

@@ -3,6 +3,7 @@ self.addEventListener("install", event => event.waitUntil(self.skipWaiting()));
 self.addEventListener("activate", event => event.waitUntil(self.clients.claim()));
 
 function notificationUrl(data) {
+  if (data?.path === "/recommendations") return "/recommendations";
   const id = typeof data?.conversationUuid === "string" ? data.conversationUuid : "";
   return id ? `/chat?id=${encodeURIComponent(id)}` : "/settings?section=system-settings&domain=notifications";
 }
@@ -30,7 +31,7 @@ self.addEventListener("notificationclick", event => {
     let target = new URL("/chat", self.location.origin).href;
     try {
       const candidate = new URL(event.notification.data?.url || "/chat", self.location.origin);
-      if (candidate.origin === self.location.origin && !candidate.username && !candidate.password && ["/chat", "/settings"].includes(candidate.pathname)) target = candidate.href;
+      if (candidate.origin === self.location.origin && !candidate.username && !candidate.password && ["/chat", "/settings", "/recommendations"].includes(candidate.pathname)) target = candidate.href;
     } catch { /* A malformed old notification still opens a safe app page. */ }
     const clients = await self.clients.matchAll({type: "window", includeUncontrolled: true});
     const exact = clients.find(client => client.url === target);

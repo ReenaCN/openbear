@@ -562,7 +562,7 @@ class WebAdminChatHandlersMixin:
             FROM web_operations AS operations
             WHERE operations.conversation_uuid=?
               AND operations.op_id=?
-              AND operations.op_type IN ('tool','user_interaction','context_compaction')
+              AND operations.op_type IN ('tool','user_interaction','context_compaction','reasoning')
             LIMIT 1
             """,
             (conv_uuid, conv_uuid, operation_id),
@@ -1921,6 +1921,8 @@ class WebAdminChatHandlersMixin:
         return out
 
     async def _start_or_steer_web_conversation_locked(self, row: dict[str, Any], text: str, media: list[InboundMedia], live: _WebLiveStream, *, telegram_submission_id: int = 0, reference_order: list[str] | None = None) -> dict[str, Any]:
+        if self._web_stopping:
+            return {"ok": False, "error": "server_stopping"}
         internal_chat_id = int(row["internal_chat_id"])
         conv_uuid = str(row.get("conversation_uuid") or "")
         turn_uuid = str(uuid.uuid4())
@@ -1958,11 +1960,20 @@ class WebAdminChatHandlersMixin:
             text = effective_reference_text(text, reference_manifest)
             visible_user_text = effective_reference_text(visible_user_text, reference_manifest)
             input_metadata.update(referenceBundleId=reference_bundle_id, references=reference_manifest)
+        rec_service = getattr(self, "recommendations", None)
+        if rec_service is not None:
+            # Feedback only: a card brought into a sent message, or a later human
+            # follow-up in a conversation that started from a card.
+            with contextlib.suppress(Exception):
+                await rec_service.observe_user_message(row, reference_manifest or [], turn_uuid)
         # While the main controller is alive (including its event-driven wait),
         # interruptions stay in the original root and wake that controller.
         # A detached/waiting Agent alone must not strand input in this queue.
         # Recheck after reference preparation, which may outlast the old runner.
         if self.runs is not None and self.runs.is_running(internal_chat_id):
+            # Keep this runner across publishing/acceptance awaits. A later
+            # registry lookup hides completed tasks and would miss the handoff.
+            runner = getattr(self.runs, "task", lambda _chat_id: None)(internal_chat_id)
             if media:
                 return {"ok": False, "error": "attachments_while_running_not_supported"}
             root_turn_uuid = str(active_round.get("rootTurnUuid") or "").strip() or await self._latest_visible_root_turn_uuid(conv_uuid) or turn_uuid
@@ -2002,6 +2013,9 @@ class WebAdminChatHandlersMixin:
             wake_event = self._web_controller_wake_events.get(conv_uuid)
             if wake_event is not None:
                 wake_event.set()
+            if runner is not None:
+                # add_done_callback also works if acceptance outlasted the runner.
+                runner.add_done_callback(lambda finished: self._schedule_steering_handoff(row, finished))
             pending_items = steering.pending_items(internal_chat_id)
             await live.publish({
                 "type": "pending_steering",
@@ -2013,6 +2027,59 @@ class WebAdminChatHandlersMixin:
             await self._touch_web_conversation(conv_uuid, current_status="已追加到当前轮")
             return {"ok": True, "queued": True, "pendingSteering": pending_items, "rootTurnUuid": root_turn_uuid, "activeRound": active_round}
 
+        background_control_payload = await self._background_control_payload(active_background_tasks)
+
+        if conv_uuid:
+            webhooks = getattr(self, 'webhooks', None)
+            if webhooks is not None:
+                await webhooks.accept_human_conversation(int(row['owner_chat_id']), conv_uuid)
+            self._web_stop_markers.pop(conv_uuid, None)
+            self._web_stopped_task_uuids.pop(conv_uuid, None)
+        attachments_public = await self._web_media_attachments_public(row, media or [], turn_uuid=turn_uuid, op_id=f"msg:{user_message_uuid}")
+        renderer = _WebStreamRenderer(
+            live=live,
+            artifact_rewriter=self._web_assistant_artifact_rewriter(row, turn_uuid=turn_uuid),
+        )
+        starting_turns = self._web_starting_turns.setdefault(conv_uuid, set()) if conv_uuid else None
+        if starting_turns is not None:
+            starting_turns.add(turn_uuid)
+        try:
+            if telegram_submission_id:
+                # Persist the return channel before starting any Agent side effect.
+                await self.web_task_telegram.enable_direct_reply(row, turn_uuid)
+            await live.publish({"type": "accepted", "chatId": internal_chat_id, "turnUuid": turn_uuid, "runUuid": turn_uuid, **input_metadata})
+            await live.publish({
+                "type": "user",
+                **input_metadata,
+                "turnUuid": turn_uuid,
+                "messageUuid": user_message_uuid,
+                "text": visible_user_text,
+                "attachments": attachments_public,
+            })
+            if self._web_stopping:
+                return {"ok": False, "error": "server_stopping"}
+            task = asyncio.create_task(self._run_web_turn(
+                internal_chat_id,
+                text,
+                renderer,
+                media=media,
+                conversation=row,
+                background_control_payload=background_control_payload,
+                root_turn_uuid=turn_uuid,
+                user_op_id=f"msg:{user_message_uuid}",
+                user_message_source=source,
+                **({"reference_bundle_id": reference_bundle_id} if reference_bundle_id else {}),
+            ))
+            if self.runs is not None:
+                self.runs.register(internal_chat_id, task)
+        finally:
+            if starting_turns is not None:
+                starting_turns.discard(turn_uuid)
+                if not starting_turns:
+                    self._web_starting_turns.pop(conv_uuid, None)
+        return {"ok": True, "queued": False, **({"rootTurnUuid": turn_uuid} if telegram_submission_id else {})}
+
+    async def _background_control_payload(self, active_background_tasks: list[Any]) -> dict[str, Any] | None:
         background_control_payload: dict[str, Any] | None = None
         if active_background_tasks:
             background_tasks_payload = []
@@ -2051,54 +2118,94 @@ class WebAdminChatHandlersMixin:
                     "to control a specific background task; if multiple tasks match ambiguously, ask a brief clarification."
                 ),
             }
+        return background_control_payload
 
-        if conv_uuid:
+    def _schedule_steering_handoff(self, row: dict[str, Any], finished: asyncio.Task[Any]) -> None:
+        # Stop clears the queue; a failed turn leaves it for the user's next message.
+        if finished.cancelled() or finished.exception() is not None or finished.result() is False or self._web_stopping:
+            return
+        task = asyncio.get_running_loop().create_task(
+            self._resume_stranded_steering(row), name=f"web-steering-handoff-{str(row.get('conversation_uuid') or '')[:8]}",
+        )
+        self._web_steering_handoffs.add(task)
+        task.add_done_callback(self._web_steering_handoffs.discard)
+
+    async def _resume_stranded_steering(self, row: dict[str, Any]) -> None:
+        """Start a turn for input queued after the finished runner's last steering boundary."""
+        internal_chat_id = int(row["internal_chat_id"])
+        conv_uuid = str(row.get("conversation_uuid") or "")
+        # The send path holds this lock from its running check through enqueue.
+        async with self.operation_locks.chat(internal_chat_id, "web_send"):
+            items = steering.pending_items(internal_chat_id)
+            if self._web_stopping or not items or self.runs is None or self.runs.is_running(internal_chat_id) or self._web_stop_markers.get(conv_uuid):
+                return
+            current = await self._conversation_row(int(row["owner_chat_id"]), conv_uuid)
+            if current is None or str(current.get("status") or "") == "error":
+                return
+            turn_uuid = str(uuid.uuid4())
+            first = items[0]
+            rest = [{**item, "turnUuid": turn_uuid, "rootTurnUuid": turn_uuid} for item in items[1:]]
+            active_background_tasks = []
+            if self.agent_dao is not None:
+                with contextlib.suppress(Exception):
+                    active_background_tasks = await self.agent_dao.active_tasks_for_chat(internal_chat_id, limit=100, controllable=True)
+            background_control_payload = await self._background_control_payload([
+                task_row for task_row in active_background_tasks
+                if str(getattr(task_row, "parent_session_uuid", "") or "") == conv_uuid
+            ])
+            message_uuid = str(first.get("messageUuid") or uuid.uuid4())
+            source = "telegram" if first.get("source") == "telegram" else "web"
+            source_metadata = {"source": "telegram"} if source == "telegram" else {}
+            references = first.get("references") or []
+            bundle_id = str(first.get("referenceBundleId") or "")
+            live = self._live_for(current)
+            await live.publish({"type": "pending_steering", "action": "snapshot", "items": rest})
             webhooks = getattr(self, 'webhooks', None)
             if webhooks is not None:
-                await webhooks.accept_human_conversation(int(row['owner_chat_id']), conv_uuid)
-            self._web_stop_markers.pop(conv_uuid, None)
-            self._web_stopped_task_uuids.pop(conv_uuid, None)
-        attachments_public = await self._web_media_attachments_public(row, media or [], turn_uuid=turn_uuid, op_id=f"msg:{user_message_uuid}")
-        renderer = _WebStreamRenderer(
-            live=live,
-            artifact_rewriter=self._web_assistant_artifact_rewriter(row, turn_uuid=turn_uuid),
-        )
-        starting_turns = self._web_starting_turns.setdefault(conv_uuid, set()) if conv_uuid else None
-        if starting_turns is not None:
+                await webhooks.accept_human_conversation(int(current['owner_chat_id']), conv_uuid)
+            renderer = _WebStreamRenderer(
+                live=live,
+                artifact_rewriter=self._web_assistant_artifact_rewriter(current, turn_uuid=turn_uuid),
+            )
+            starting_turns = self._web_starting_turns.setdefault(conv_uuid, set())
             starting_turns.add(turn_uuid)
-        try:
-            if telegram_submission_id:
-                # Persist the return channel before starting any Agent side effect.
-                await self.web_task_telegram.enable_direct_reply(row, turn_uuid)
-            await live.publish({"type": "accepted", "chatId": internal_chat_id, "turnUuid": turn_uuid, "runUuid": turn_uuid, **input_metadata})
-            await live.publish({
-                "type": "user",
-                **input_metadata,
-                "turnUuid": turn_uuid,
-                "messageUuid": user_message_uuid,
-                "text": visible_user_text,
-                "attachments": attachments_public,
-            })
-            task = asyncio.create_task(self._run_web_turn(
-                internal_chat_id,
-                text,
-                renderer,
-                media=media,
-                conversation=row,
-                background_control_payload=background_control_payload,
-                root_turn_uuid=turn_uuid,
-                user_op_id=f"msg:{user_message_uuid}",
-                user_message_source=source,
-                **({"reference_bundle_id": reference_bundle_id} if reference_bundle_id else {}),
-            ))
-            if self.runs is not None:
+            try:
+                if source == "telegram" and getattr(self, "web_task_telegram", None) is not None:
+                    await self.web_task_telegram.enable_direct_reply(current, turn_uuid)
+                await live.publish({"type": "accepted", "chatId": internal_chat_id, "turnUuid": turn_uuid, "runUuid": turn_uuid, **source_metadata})
+                # Same message id: the queued bubble becomes this turn's input instead of a second copy.
+                await live.publish({
+                    "type": "user",
+                    **source_metadata,
+                    "turnUuid": turn_uuid,
+                    "messageUuid": message_uuid,
+                    "text": str(first.get("visibleText") or first.get("text") or ""),
+                    **({"references": references, "referenceBundleId": bundle_id} if references else {}),
+                })
+                if self._web_stopping:
+                    return
+                # No await between consuming input and registering its owner.
+                # Cancellation during handoff preparation leaves the queue intact.
+                steering.drain_items(internal_chat_id)
+                for item in rest:
+                    steering.enqueue(internal_chat_id, item)
+                task = asyncio.create_task(self._run_web_turn(
+                    internal_chat_id,
+                    str(first.get("text") or ""),
+                    renderer,
+                    media=[],
+                    conversation=current,
+                    background_control_payload=background_control_payload,
+                    root_turn_uuid=turn_uuid,
+                    user_op_id=f"msg:{message_uuid}",
+                    user_message_source=source,
+                    **({"reference_bundle_id": bundle_id} if bundle_id else {}),
+                ))
                 self.runs.register(internal_chat_id, task)
-        finally:
-            if starting_turns is not None:
+            finally:
                 starting_turns.discard(turn_uuid)
                 if not starting_turns:
                     self._web_starting_turns.pop(conv_uuid, None)
-        return {"ok": True, "queued": False, **({"rootTurnUuid": turn_uuid} if telegram_submission_id else {})}
 
     async def handle_api_conversation_ws(self, request: web.Request) -> web.WebSocketResponse:
         session: WebSession = request[_WEB_SESSION_KEY]
