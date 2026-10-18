@@ -41,33 +41,64 @@ class WebAdminOperationsMixin:
         per conversation; only older superseded frames are removed.
         """
         cutoff_ms = int((time.time() - max(1, int(max_age_days)) * 86_400) * 1000)
-        where_conversation = ""
-        params: list[Any] = [cutoff_ms, max(100, int(keep_recent))]
+        keep_recent = max(100, int(keep_recent))
+        batch_size = 100
         if conversation_uuid:
-            where_conversation = "AND f.conversation_uuid=?"
-            params.append(str(conversation_uuid))
-        cur = await self.db.conn.execute(
-            f"""
-            DELETE FROM web_event_frames AS f
-            WHERE (
-                f.updated_at_ms < ?
-                OR f.frame_seq <= (
-                  SELECT COALESCE(MAX(recent.frame_seq), 0) - ?
-                  FROM web_event_frames AS recent
-                  WHERE recent.conversation_uuid=f.conversation_uuid
+            conversations = [str(conversation_uuid)]
+        else:
+            cur = await self.db.conn.execute(
+                "SELECT DISTINCT conversation_uuid FROM web_event_frames"
+            )
+            async with cur:
+                conversations = [str(row[0]) for row in await cur.fetchall()]
+
+        deleted = 0
+        for conv_uuid in conversations:
+            cur = await self.db.conn.execute(
+                "SELECT COALESCE(MAX(frame_seq), 0) FROM web_event_frames WHERE conversation_uuid=?",
+                (conv_uuid,),
+            )
+            async with cur:
+                high_water = int((await cur.fetchone())[0])
+            after_seq = 0
+            while after_seq < high_water:
+                # Read only metadata on the reader connection, before acquiring
+                # the application writer. Bound the scan as well as the DELETE:
+                # LIMIT on eligible rows alone can still scan the whole history.
+                cur = await self.db.conn.execute(
+                    """
+                    SELECT f.id, f.frame_seq,
+                           (f.updated_at_ms < ? OR f.frame_seq <= ?)
+                           AND EXISTS (
+                               SELECT 1 FROM web_event_frames AS newer
+                               WHERE newer.conversation_uuid=f.conversation_uuid
+                                 AND newer.op_id=f.op_id AND newer.id > f.id
+                           ) AS obsolete
+                    FROM web_event_frames AS f
+                    WHERE f.conversation_uuid=? AND f.frame_seq > ? AND f.frame_seq <= ?
+                    ORDER BY f.frame_seq
+                    LIMIT ?
+                    """,
+                    (cutoff_ms, high_water - keep_recent, conv_uuid,
+                     after_seq, high_water, batch_size),
                 )
-              )
-              {where_conversation}
-              AND f.id NOT IN (
-                SELECT MAX(latest.id)
-                FROM web_event_frames AS latest
-                GROUP BY latest.conversation_uuid, latest.op_id
-              )
-            """,
-            tuple(params),
-        )
-        await self.db.conn.commit()
-        return max(0, int(cur.rowcount or 0))
+                async with cur:
+                    rows = await cur.fetchall()
+                if not rows:
+                    break
+                after_seq = int(rows[-1][1])
+                ids = [int(row[0]) for row in rows if row[2]]
+                if ids:
+                    placeholders = ",".join("?" for _ in ids)
+                    async with self.db.write_transaction(label="web-event-frame-retention-batch") as conn:
+                        async with conn.execute(
+                            f"DELETE FROM web_event_frames WHERE id IN ({placeholders})", tuple(ids),
+                        ) as cur:
+                            deleted += max(0, int(cur.rowcount or 0))
+                # A finite high-water mark also prevents a busy conversation
+                # from keeping this maintenance pass alive indefinitely.
+                await asyncio.sleep(0)
+        return deleted
 
     async def _prune_web_task_notification_history(self, *, max_age_days: int = 30) -> int:
         cutoff = int(time.time()) - max(1, int(max_age_days)) * 86_400

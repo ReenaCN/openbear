@@ -344,6 +344,9 @@ CREATE TABLE IF NOT EXISTS web_event_frames (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_web_event_frames_conv_seq
   ON web_event_frames(conversation_uuid, frame_seq);
+-- Retention probes for a newer transport frame without scanning every revision.
+CREATE INDEX IF NOT EXISTS idx_web_event_frames_conv_op_id
+  ON web_event_frames(conversation_uuid, op_id, id);
 CREATE INDEX IF NOT EXISTS idx_web_event_frames_conv_op_revision
   ON web_event_frames(conversation_uuid, op_id, revision);
 CREATE INDEX IF NOT EXISTS idx_web_event_frames_conv_turn_seq
